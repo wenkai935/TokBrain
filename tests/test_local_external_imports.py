@@ -83,7 +83,7 @@ async def test_integration_token_is_hashed_rotated_and_revoked():
     assert (await integration_token_status(session))["configured"] is False
     first = await rotate_integration_token(session)
     assert first["token"].startswith("tb_")
-    assert first["token"] not in str((await integration_token_status(session)))
+    assert first["token"] not in str(await integration_token_status(session))
     stored_token = await session.get(AppSetting, "external_import_token")
     assert first["token"] not in str(stored_token.value)
     assert len(stored_token.value["sha256"]) == 64

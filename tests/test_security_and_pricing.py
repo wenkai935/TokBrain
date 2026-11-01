@@ -357,6 +357,8 @@ def test_runtime_dependencies_keep_pinned_f2_without_browser_stack():
 async def test_provider_reuses_and_closes_openai_clients(monkeypatch):
     await providers.close_provider_clients()
 
+    import app.services.providers.base as providers_base
+
     class Client:
         instances: list["Client"] = []
 
@@ -367,7 +369,7 @@ async def test_provider_reuses_and_closes_openai_clients(monkeypatch):
         async def close(self):
             self.closed = True
 
-    monkeypatch.setattr(providers, "AsyncOpenAI", Client)
+    monkeypatch.setattr(providers_base, "AsyncOpenAI", Client)
     first = providers.DashScopeProvider("same-key")
     second = providers.DashScopeProvider("same-key")
     third = providers.DashScopeProvider("other-key")

@@ -10,9 +10,27 @@ def test_windows_powershell_scripts_use_utf8_bom():
         ROOT / "scripts" / "setup.ps1",
         ROOT / "scripts" / "stop.ps1",
         ROOT / "scripts" / "prepublish_check.ps1",
+        ROOT / "scripts" / "menu.ps1",
     )
     for script in scripts:
         assert script.read_bytes().startswith(b"\xef\xbb\xbf"), script
+
+
+def test_single_entry_launcher_is_a_thin_wrapper_around_the_menu():
+    launcher = (ROOT / "TokBrain.cmd").read_text(encoding="utf-8")
+    assert r"scripts\menu.ps1" in launcher
+    assert "-ExecutionPolicy Bypass" in launcher
+    # Arguments must reach the script so `TokBrain.cmd status` works headlessly.
+    assert "%*" in launcher
+
+    menu = (ROOT / "scripts" / "menu.ps1").read_text(encoding="utf-8-sig")
+    for subcommand in ("status", "install", "start", "start-bg", "stop", "restart"):
+        assert subcommand in menu
+    # Every action must delegate to an existing entry point instead of
+    # re-implementing service control.
+    assert r'scripts\setup.ps1' in menu
+    assert r'scripts\stop.ps1' in menu
+    assert "start.ps1" in menu
 
 
 def test_setup_launcher_uses_process_scoped_execution_policy_bypass():

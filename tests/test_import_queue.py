@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.routers_v2.imports as import_routes
 import app.services.import_queue as imports
-import app.services.jobs as jobs
 from app.main import app
 from app.models import (
     Base,
@@ -36,6 +35,7 @@ from app.services.f2_links import (
     PublicWork,
 )
 from app.schemas import ImportBatchCreate
+from app.services.runtime_settings import update_runtime_settings
 from app.services.secrets import SecretUnavailableError
 
 
@@ -135,7 +135,14 @@ def install_test_runtime(monkeypatch, factory):
 
 def test_import_batch_create_restores_manual_preview_contract():
     payload = ImportBatchCreate(text="https://v.douyin.com/a/")
-    assert payload.model_dump() == {"text": "https://v.douyin.com/a/"}
+    # Manual preview stays the default path: the metadata-only shortcut stays
+    # off and no title/author is invented for the pasted link.
+    assert payload.model_dump() == {
+        "text": "https://v.douyin.com/a/",
+        "metadata_only": False,
+        "title": None,
+        "author": None,
+    }
     with pytest.raises(ValidationError):
         ImportBatchCreate(text="https://v.douyin.com/a/", start_processing=True)
     with pytest.raises(ValidationError):
@@ -152,7 +159,7 @@ def test_import_batch_create_restores_manual_preview_contract():
     ]["application/json"]["schema"]
     assert request_schema["$ref"].endswith("/ImportBatchCreate")
     properties = schema["components"]["schemas"]["ImportBatchCreate"]["properties"]
-    assert set(properties) == {"text"}
+    assert set(properties) == {"text", "metadata_only", "title", "author"}
 
 
 async def test_batch_limit_applies_after_duplicate_links_are_removed(tmp_path):
@@ -164,6 +171,9 @@ async def test_batch_limit_applies_after_duplicate_links_are_removed(tmp_path):
             "https://v.douyin.com/item-0/?second-copy=ignored",
             *[f"https://v.douyin.com/item-{index}/" for index in range(12)],
         ]
+        # Pin the batch limit explicitly so the assertion is independent of the
+        # deployment default (which changed from 10 to 100).
+        await update_runtime_settings(session, {"import_batch_limit": 10})
         batch, queued, rejected = await create_import_batch(session, "\n".join(links))
         items = (
             (
@@ -661,11 +671,16 @@ async def test_unreadable_f2_cookie_marks_item_failed_without_leaking_secret_err
 ):
     engine, factory = await database_factory(tmp_path)
     install_test_runtime(monkeypatch, factory)
+    # 这条约束只对 f2 通道成立：浏览器通道不读 Cookie（见 test_browser_resolver.py
+    # 的 test_browser_channel_ignores_broken_cookie），所以这里显式切回 f2。
+    monkeypatch.setattr("app.services.import_queue.LINK_RESOLVER", "f2")
 
     async def unreadable_cookie(_session, _name):
         raise SecretUnavailableError("sensitive DPAPI detail")
 
-    monkeypatch.setattr(imports, "get_secret", unreadable_cookie)
+    # Cookie 读取已收敛到 app.services.cookie_store（文件优先、Secret 兜底），
+    # 因此补丁打在 secrets 模块上，而不是 import_queue 的旧引用点。
+    monkeypatch.setattr("app.services.secrets.get_secret", unreadable_cookie)
     async with factory() as session:
         batch, item_ids, _ = await create_import_batch(
             session, "https://www.douyin.com/video/7350000000000000731"

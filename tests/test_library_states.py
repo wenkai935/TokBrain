@@ -90,6 +90,7 @@ async def test_library_has_one_local_space_and_four_states():
             collection_id=None,
             offset=0,
             limit=60,
+            lid=None,
             session=session,
         )
         assert page["total"] == 1
@@ -205,6 +206,7 @@ async def test_supplement_is_an_independent_virtual_library_state():
         collection_id=None,
         offset=0,
         limit=60,
+        lid=None,
         session=session,
     )
     assert page["total"] == 2
@@ -289,6 +291,7 @@ async def test_in_library_without_knowledge_is_not_exposed_as_searchable():
         collection_id=None,
         offset=0,
         limit=60,
+        lid=None,
         session=session,
     )
     assert page["total"] == 0
@@ -481,6 +484,7 @@ async def test_local_collection_is_shared_by_pending_and_in_library_states():
         collection_id=group["id"],
         offset=0,
         limit=60,
+        lid=None,
         session=session,
     )
     ready_page = await works(
@@ -488,6 +492,7 @@ async def test_local_collection_is_shared_by_pending_and_in_library_states():
         collection_id=group["id"],
         offset=0,
         limit=60,
+        lid=None,
         session=session,
     )
     assert [item["title"] for item in pending_page["items"]] == ["待处理作品"]
@@ -509,6 +514,7 @@ async def test_local_collection_is_shared_by_pending_and_in_library_states():
         collection_id=group["id"],
         offset=0,
         limit=60,
+        lid=None,
         session=session,
     )
     assert {item["title"] for item in transitioned["items"]} == {

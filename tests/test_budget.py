@@ -1,6 +1,8 @@
 import asyncio
 
 import pytest
+from datetime import date
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -116,6 +118,35 @@ async def test_failed_work_consumes_real_usage_without_counting_success(
     assert counter.works_used == 0
     assert counter.media_minutes_used == pytest.approx(3.5)
     assert counter.llm_tokens_used == 125
+    await engine.dispose()
+
+
+async def test_reservation_settles_on_the_day_it_was_created(tmp_path, monkeypatch):
+    engine, factory = await budget_factory(tmp_path)
+    current_day = {"value": date(2026, 10, 30)}
+
+    async def limits(_session):
+        return {
+            "daily_media_minutes_limit": 60.0,
+            "daily_llm_token_limit": 10_000,
+        }
+
+    monkeypatch.setattr(budget, "get_runtime_settings", limits)
+    monkeypatch.setattr(budget, "local_day", lambda: current_day["value"])
+    async with factory() as session:
+        reservation = await budget.reserve(session, works=1, llm_tokens=900)
+        await session.commit()
+        current_day["value"] = date(2026, 10, 31)
+        await budget.consume(session, reservation, actual_llm_tokens=700)
+        await session.commit()
+        old_day = await session.get(DailyBudget, date(2026, 10, 30))
+        new_day = await session.get(DailyBudget, date(2026, 10, 31))
+
+    assert reservation.day == date(2026, 10, 30)
+    assert old_day is not None
+    assert old_day.llm_tokens_reserved == 0
+    assert old_day.llm_tokens_used == 700
+    assert new_day is None
     await engine.dispose()
 
 

@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models import Base, Collection, CollectionMembership, KnowledgeChunk, Work
 import app.services.knowledge as knowledge
+from app.services.budget import Reservation
 from app.services.knowledge import search
 from app.services.providers import ProviderUsage
 
@@ -130,7 +131,9 @@ async def test_embedding_failure_falls_back_to_lexical_search(session, monkeypat
     released = False
 
     class FailingProvider:
-        def __init__(self, _key):
+        # knowledge._build_provider constructs the provider with keyword
+        # arguments (base_url / embedding_model / chat_model).
+        def __init__(self, _key, **_kwargs):
             pass
 
         async def embed(self, _texts):
@@ -140,7 +143,7 @@ async def test_embedding_failure_falls_back_to_lexical_search(session, monkeypat
         return "test-key"
 
     async def fake_reserve(*_args, **_kwargs):
-        return object()
+        return Reservation(works=0, media_minutes=0.0, llm_tokens=0)
 
     async def fake_release(*_args, **_kwargs):
         nonlocal released
@@ -165,7 +168,7 @@ async def test_semantic_search_keeps_exact_chinese_phrase_above_unrelated_vector
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
     class FakeProvider:
-        def __init__(self, _key):
+        def __init__(self, _key, **_kwargs):
             pass
 
         async def embed(self, _texts):
@@ -175,7 +178,9 @@ async def test_semantic_search_keeps_exact_chinese_phrase_above_unrelated_vector
         return "test-key"
 
     async def fake_reserve(*_args, **_kwargs):
-        return object()
+        # release() reads .day/.works/.media_minutes/.llm_tokens off the
+        # reservation when the provider call fails.
+        return Reservation(works=0, media_minutes=0.0, llm_tokens=0)
 
     async def no_op(*_args, **_kwargs):
         return None

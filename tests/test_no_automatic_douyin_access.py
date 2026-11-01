@@ -4,20 +4,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_removed_automation_modules_and_routes_are_absent():
+def test_removed_browser_automation_modules_and_routes_are_absent():
     removed = (
         "app/routers_v2/auth.py",
-        "app/routers_v2/sync.py",
         "app/services/accounts.py",
         "app/services/browser_auth.py",
-        "app/services/sync.py",
         "app/services/safety_quotas.py",
         "app/adapters/douyin.py",
     )
     assert all(not (ROOT / path).exists() for path in removed)
     main = (ROOT / "app/main.py").read_text(encoding="utf-8")
     assert "auth.router" not in main
-    assert "sync.router" not in main
     assert "resolve_submitted_link(" not in main
 
 
