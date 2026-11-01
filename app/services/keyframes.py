@@ -8,6 +8,7 @@ import json
 import math
 import re
 import shutil
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,10 +29,8 @@ async def _communicate_with_timeout(process, timeout_seconds: float):
             process.communicate(), timeout=max(0.01, timeout_seconds)
         )
     except (asyncio.TimeoutError, asyncio.CancelledError):
-        try:
+        with suppress(ProcessLookupError):
             process.kill()
-        except ProcessLookupError:
-            pass
         await asyncio.shield(process.wait())
         raise
 
@@ -134,10 +133,11 @@ def parse_duration_output(output: str) -> float | None:
         payload = json.loads(output)
     except (TypeError, ValueError):
         return None
-    candidates: list[object] = []
-    for stream in payload.get("streams") or []:
-        if isinstance(stream, dict):
-            candidates.append(stream.get("duration"))
+    candidates: list[object] = [
+        stream.get("duration")
+        for stream in (payload.get("streams") or [])
+        if isinstance(stream, dict)
+    ]
     format_payload = payload.get("format")
     if isinstance(format_payload, dict):
         candidates.append(format_payload.get("duration"))
@@ -389,7 +389,9 @@ async def extract_keyframe_candidates(
             ffmpeg, video_path, target, candidate.timestamp, accurate=False
         ):
             continue
-        mean, edge_std, image_hash = _image_signature(target)
+        mean, edge_std, image_hash = await asyncio.to_thread(
+            _image_signature, target
+        )
         if mean < 12 or mean > 248 or edge_std < 2.5:
             target.unlink(missing_ok=True)
             continue
@@ -479,7 +481,9 @@ async def finalize_keyframes(
             accurate=True,
         )
         if rendered:
-            mean, edge_std, image_hash = _image_signature(temporary)
+            mean, edge_std, image_hash = await asyncio.to_thread(
+                _image_signature, temporary
+            )
             item.path = temporary
             item.perceptual_hash = image_hash
             item.quality_score = _quality_score(mean, edge_std)

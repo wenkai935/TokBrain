@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,23 +29,28 @@ from app.models import (
     WorkSourceAsset,
     utcnow,
 )
+from app.services.cookie_store import cookie_header_for
 from app.services.f2_links import (
-    DAILY_LINK_LIMIT,
     ERROR_MESSAGES,
     F2WorkClient,
-    MAX_BATCH_LINKS,
     PublicLinkError,
     direct_work_id,
     extract_links,
     f2_access_gate,
+    make_lid,
     normalize_input_url,
     sanitize_url,
 )
-from app.services.secrets import SecretUnavailableError, get_secret
+from app.services.runtime_settings import get_runtime_settings
+from app.services.secrets import SecretUnavailableError
 from app.services.errors import safe_error_message
 
 
 ACTIVE_ITEM_STATES = {"queued", "resolving"}
+#: 允许「无视频资产也建作品」的来源。link（metadata_only 仅链接入库）本来就这样；
+#: platform_pull 是平台采集——拉回来的元数据已经齐全，媒体留到 ingest 阶段发现缺失后
+#: 走补件（_offer_local_supplement），不该在确认阶段被挡回去。
+NO_ASSET_SOURCE_TYPES = frozenset({"link", "platform_pull"})
 PREVIEW_SUCCESS_STATES = {
     "ready",
     "needs_local_file",
@@ -128,6 +134,7 @@ async def open_f2_circuit(
 
 async def _consume_link_quota(session: AsyncSession) -> None:
     day = shanghai_day()
+    daily_limit = (await get_runtime_settings(session))["import_daily_limit"]
     await session.execute(
         sqlite_insert(DailyLinkQuota)
         .values(day=day, attempted=0, updated_at=utcnow())
@@ -137,7 +144,7 @@ async def _consume_link_quota(session: AsyncSession) -> None:
         update(DailyLinkQuota)
         .where(
             DailyLinkQuota.day == day,
-            DailyLinkQuota.attempted < DAILY_LINK_LIMIT,
+            DailyLinkQuota.attempted < daily_limit,
         )
         .values(
             attempted=DailyLinkQuota.attempted + 1,
@@ -150,7 +157,29 @@ async def _consume_link_quota(session: AsyncSession) -> None:
 
 async def remaining_daily_quota(session: AsyncSession) -> int:
     row = await session.get(DailyLinkQuota, shanghai_day())
-    return max(0, DAILY_LINK_LIMIT - int(row.attempted if row else 0))
+    daily_limit = (await get_runtime_settings(session))["import_daily_limit"]
+    return max(0, daily_limit - int(row.attempted if row else 0))
+
+
+#: 链接解析通道。
+#:
+#: ``browser``（默认）：用系统浏览器打开作品页、只读已渲染的 DOM。
+#: 这是当前唯一能通的路径——f2 0.0.1.7 拼的 a_bogus 签名已被抖音 Argus 拦成
+#: ``403 Blocked by ArgusSecurityPlugin Uifid Not Found``，且两年没有新版本。
+#:
+#: ``f2``：旧通道，保留用于排障对照，不要在生产打开。
+LINK_RESOLVER = os.environ.get("TOKBRAIN_LINK_RESOLVER", "browser").strip().lower()
+
+
+async def _resolve_link(client: F2WorkClient, url: str, cookie: str):
+    # 调用方注入了自己的 client（测试替身或定制实现）时尊重它——显式给了实现
+    # 就不该被默认通道策略覆盖；只有拿到真正的 F2WorkClient 才按通道配置走。
+    if LINK_RESOLVER == "f2" or not isinstance(client, F2WorkClient):
+        return await client.resolve(url, cookie=cookie)
+    # 浏览器通道不需要登录态：页面自己会带正确的 webid/UIFID。
+    from app.services.browser_resolver import resolve_via_browser
+
+    return await resolve_via_browser(url)
 
 
 async def resolve_submitted_link(client: F2WorkClient, url: str):
@@ -164,10 +193,16 @@ async def resolve_submitted_link(client: F2WorkClient, url: str):
                     opens_circuit=True,
                 )
             await _consume_link_quota(gate_session)
-            cookie = await get_secret(gate_session, "f2_cookie") or ""
+            # 只有 f2 通道才需要 Cookie；浏览器通道完全不读，所以登录态坏掉
+            # 也不会连带解析失败（这正是之前 f2_cookie_unreadable 的教训）。
+            cookie = ""
+            if LINK_RESOLVER == "f2":
+                # 统一 Cookie 库：F2 与抖音采集共用 data/cookies/douyin.txt；
+                # 文件缺失时才回退旧版 f2_cookie SecretRecord。
+                cookie = await cookie_header_for(gate_session, "f2")
             await gate_session.commit()
         try:
-            return await client.resolve(url, cookie=cookie)
+            return await _resolve_link(client, url, cookie)
         except PublicLinkError as exc:
             # Persist the breaker before releasing the global network lock.
             # Otherwise another waiting worker could start in the small window
@@ -186,17 +221,27 @@ async def resolve_submitted_link(client: F2WorkClient, url: str):
 async def create_import_batch(
     session: AsyncSession,
     raw_input: str,
+    *,
+    metadata_only: bool = False,
+    title: str | None = None,
+    author: str | None = None,
 ) -> tuple[ImportBatch, list[int], int]:
     # The preflight and commit must be one local critical section. Otherwise,
     # two near-simultaneous submissions can both pass the duplicate check
     # before either one has persisted its preview items.
     async with CREATE_IMPORT_LOCK:
-        return await _create_import_batch(session, raw_input)
+        return await _create_import_batch(
+            session, raw_input, metadata_only=metadata_only, title=title, author=author
+        )
 
 
 async def _create_import_batch(
     session: AsyncSession,
     raw_input: str,
+    *,
+    metadata_only: bool = False,
+    title: str | None = None,
+    author: str | None = None,
 ) -> tuple[ImportBatch, list[int], int]:
     if await _security_cleanup_required(session):
         raise PublicLinkError("security_cleanup_required")
@@ -240,6 +285,7 @@ async def _create_import_batch(
     seen: set[str] = set()
     duplicate_count = 0
     rejected_count = 0
+    batch_limit = (await get_runtime_settings(session))["import_batch_limit"]
     for input_url in links:
         status = "queued"
         error_code = None
@@ -267,7 +313,7 @@ async def _create_import_batch(
             seen.add(identity)
             continue
         seen.add(identity)
-        if len(prepared) >= MAX_BATCH_LINKS:
+        if len(prepared) >= batch_limit:
             rejected_count += 1
             continue
         ordinal = len(prepared) + 1
@@ -323,26 +369,33 @@ async def _create_import_batch(
         error_code,
         error_message,
     ) in prepared:
+        # metadata_only（仅链接入库）：不访问抖音，条目直接以 ready 终态落库，
+        # 不进入 coordinator worker（无网络解析），confirm 阶段据此建无媒体 Work。
+        provenance = {
+            "source_type": "link",
+            "rights_attested": False,
+            "attested_at": None,
+        }
+        if metadata_only:
+            provenance["metadata_only"] = True
         item = ImportItem(
             batch_id=batch_id,
             ordinal=ordinal,
             input_url=sanitize_url(input_url) or "",
             normalized_url=normalized,
             platform_work_id=platform_work_id,
-            status=status,
+            status="ready" if metadata_only else status,
             error_code=error_code,
             error_message=error_message,
-            raw_metadata={
-                "import_provenance": {
-                    "source_type": "link",
-                    "rights_attested": False,
-                    "attested_at": None,
-                }
-            },
+            canonical_url=normalized if metadata_only else None,
+            kind="video" if metadata_only else None,
+            title=(title or (f"待补件 · {platform_work_id or normalized[:48]}" if metadata_only else None)),
+            author_name=author if metadata_only else None,
+            raw_metadata={"import_provenance": provenance},
         )
         session.add(item)
         await session.flush()
-        if status == "queued":
+        if status == "queued" and not metadata_only:
             queued_ids.append(item.id)
     if not queued_ids:
         await _refresh_batch(session, batch_id)
@@ -520,7 +573,7 @@ async def batch_view(session: AsyncSession, batch_id: str) -> dict:
         "progress": dict(job.progress or {}) if job else {},
         "workers": resolving,
         "remaining_daily": await remaining_daily_quota(session),
-        "daily_limit": DAILY_LINK_LIMIT,
+        "daily_limit": (await get_runtime_settings(session))["import_daily_limit"],
         "circuit": circuit,
         "items": [
             {
@@ -533,6 +586,7 @@ async def batch_view(session: AsyncSession, batch_id: str) -> dict:
                 "normalized_url": item.normalized_url,
                 "canonical_url": item.canonical_url,
                 "platform_work_id": item.platform_work_id,
+                "lid": make_lid(item.input_url or ""),
                 "kind": item.kind,
                 "title": item.title,
                 "author_name": item.author_name,
@@ -642,7 +696,7 @@ async def _confirm_import_items(
     *,
     commit: bool = True,
 ) -> dict:
-    requested = set(int(item) for item in item_ids)
+    requested = {int(item) for item in item_ids}
     requested_collections = {
         int(item_id): int(collection_id)
         for item_id, collection_id in (collection_ids or {}).items()
@@ -716,12 +770,14 @@ async def _confirm_import_items(
             assets_by_item.setdefault(int(asset.import_item_id), []).append(asset)
 
     identity_by_item: dict[int, tuple[str, str]] = {}
+    lid_by_item: dict[int, str] = {}
     target_collection_by_item: dict[int, int] = {}
     for item in items:
         platform_work_id = item.platform_work_id or (
             "local-" + hashlib.sha256(item.normalized_url.encode()).hexdigest()[:32]
         )
         identity_by_item[int(item.id)] = (item.platform or "douyin", platform_work_id)
+        lid_by_item[int(item.id)] = make_lid(item.input_url or "")
         target_collection_by_item[int(item.id)] = requested_collections.get(
             item.id, item.target_collection_id or manual_group.id
         )
@@ -738,7 +794,22 @@ async def _confirm_import_items(
     work_by_identity = {
         (str(work.platform), str(work.platform_work_id)): work for work in existing_works
     }
-    existing_work_ids = {int(work.id) for work in existing_works}
+    # LID 去重兜底：同原始分享链接（飞书 LID 同源）已入库过则复用，避免
+    # platform_work_id 缺失/预检失败时重复创建 work（v2 核心诉求）。
+    lid_set = {lid for lid in lid_by_item.values() if lid}
+    lid_works = (
+        (
+            await session.execute(
+                select(Work).where(Work.lid.in_(lid_set))
+            )
+        )
+        .scalars()
+        .all()
+    ) if lid_set else []
+    work_by_lid = {str(work.lid): work for work in lid_works if work.lid}
+    existing_work_ids = {int(work.id) for work in existing_works} | {
+        int(work.id) for work in lid_works
+    }
     target_collection_ids = set(target_collection_by_item.values()) | {manual_group.id}
     membership_pairs = {
         (int(collection_id), int(work_id))
@@ -756,21 +827,25 @@ async def _confirm_import_items(
     }
 
     work_ids: list[int] = []
+    allow_missing_asset = batch.source_type in NO_ASSET_SOURCE_TYPES
     for item in items:
         assets = assets_by_item[int(item.id)]
-        if batch.source_type != "link" and not any(
+        if not allow_missing_asset and not any(
             asset.kind == "video" and Path(asset.path).is_file() for asset in assets
         ):
             item.status = "needs_local_file"
             item.error_code = "missing_video"
             item.error_message = "已上传视频不存在，请重新上传"
             continue
-        if item.status == "needs_local_file" and not assets:
+        if item.status == "needs_local_file" and not assets and not allow_missing_asset:
             continue
         platform, platform_work_id = identity_by_item[int(item.id)]
         target_collection_id = target_collection_by_item[int(item.id)]
         target_group = collection_map.get(target_collection_id, manual_group)
         work = work_by_identity.get((platform, platform_work_id))
+        if not work:
+            # 兜底：platform_work_id 未命中时按 LID（同源分享链接）找已入库作品
+            work = work_by_lid.get(lid_by_item.get(int(item.id), ""))
         if work:
             membership_key = (int(target_group.id), int(work.id))
             if membership_key not in membership_pairs:
@@ -814,6 +889,7 @@ async def _confirm_import_items(
         work = Work(
             platform=platform,
             platform_work_id=platform_work_id,
+            lid=make_lid(item.input_url or ""),
             kind=item.kind or ("image" if len(assets) > 1 else "video"),
             title=item.title or f"本地补件 {platform_work_id[-8:]}",
             description=item.description or "",
@@ -980,9 +1056,9 @@ class ImportCoordinator:
             except TimeoutError:
                 logger.error("链接预检 worker 未能在 5 秒内停止")
         while True:
-            try:
+            try:  # drain each queued item and mark it done.
                 self.queue.get_nowait()
-            except asyncio.QueueEmpty:
+            except asyncio.QueueEmpty:  # noqa: PERF203
                 break
             else:
                 self.queue.task_done()
@@ -1086,7 +1162,7 @@ class ImportCoordinator:
                             await session.commit()
                         return
             result = await resolve_submitted_link(self.client, input_url)
-            async with PREVIEW_IDENTITY_LOCK:
+            async with PREVIEW_IDENTITY_LOCK:  # noqa: SIM117 - nested to keep session scope explicit.
                 async with async_session_factory() as session:
                     item = await session.get(ImportItem, item_id)
                     if not item:
@@ -1099,6 +1175,16 @@ class ImportCoordinator:
                             )
                         )
                     ).scalar_one_or_none()
+                    if existing is None:
+                        # LID 兜底：resolve 出的 platform_work_id 未命中（如风控
+                        # 预检失败但同源分享链接已入库过）时按 LID 复用已存在作品
+                        existing = (
+                            await session.execute(
+                                select(Work).where(
+                                    Work.lid == make_lid(item.input_url or "")
+                                )
+                            )
+                        ).scalar_one_or_none()
                     previous_preview = await session.scalar(
                         select(ImportItem.id)
                         .where(

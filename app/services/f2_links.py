@@ -1,8 +1,20 @@
-"""User-initiated Douyin link resolution backed only by F2 post detail."""
+"""DEPRECATED (Douyin discovery): Douyin login + video discovery has moved to the
+zhicui-based platform connectors in ``app/services/platforms`` (handoff cookie ->
+``collect_douyin`` -> ``create_platform_import_batch``). New Douyin imports no longer
+use this module.
+
+This module is kept ONLY for the legacy F2 media-download path (``downloader.py`` /
+``jobs._refresh_f2_media``) that still fetches actual video bytes for already-imported
+works. That path should be replaced with a zhicui/signed-media downloader in a follow-up;
+until then it remains the media fetcher but is no longer the discovery mechanism.
+"""
+
+# User-initiated Douyin link resolution backed only by F2 post detail.
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import ipaddress
 import math
@@ -12,14 +24,13 @@ import socket
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Any, TypeVar
+from collections.abc import Awaitable, Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
 
-MAX_BATCH_LINKS = 10
-DAILY_LINK_LIMIT = 150
 MIN_LINK_COOLDOWN_SECONDS = 4.0
 MAX_LINK_COOLDOWN_SECONDS = 8.0
 MAX_REDIRECTS = 5
@@ -56,8 +67,9 @@ ERROR_MESSAGES = {
     "unsupported_host": "该链接不是受支持的抖音公开域名",
     "redirect_blocked": "链接重定向到了不允许访问的地址",
     "too_many_redirects": "链接重定向次数过多",
-    "daily_limit_exceeded": "已达到今日 150 条链接解析上限",
+    "daily_limit_exceeded": "已达到今日链接解析上限",
     "access_forbidden": "抖音拒绝了本次作品解析请求",
+    "browser_unavailable": "本机没有可用的 playwright-cli，浏览器解析通道无法启动",
     "rate_limited": "抖音请求过于频繁，请等待风控冷却结束",
     "risk_verification": "抖音要求验证码或安全验证",
     "network_timeout": "访问抖音超时",
@@ -194,6 +206,16 @@ def normalize_input_url(url: str) -> str:
     parsed = urlsplit(value)
     path = re.sub(r"/+", "/", parsed.path or "/")
     return urlunsplit(("https", parsed.netloc.lower(), path.rstrip("/") or "/", "", ""))
+
+
+def make_lid(link: str) -> str:
+    """生成数据唯一标识 LID：``lid_`` + sha256(链接) 前 16 位。
+
+    与 bridge `_make_lid`（bridge_feishu_obsidian.py）及 doubaosave `make_lid`
+    完全同规则，保证 works.lid 与飞书表 LID 同源一致，可作为跨系统关联主键。
+    """
+    raw = (link or "").strip()
+    return "lid_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def direct_work_id(url: str) -> str | None:
@@ -616,7 +638,7 @@ class F2WorkClient:
             work_id = await self._resolve_short_link(normalized)
         last_error: PublicLinkError | None = None
         for attempt in range(2):
-            try:
+            try:  # retry transient network errors per attempt.
                 payload = await self._fetch_detail(work_id, cookie)
                 if not isinstance(payload, dict):
                     raise PublicLinkError("f2_contract_changed")
@@ -656,7 +678,7 @@ class F2WorkClient:
                     )
                 _add_media_policy(detail, payload)
                 return _normalize_detail(detail)
-            except PublicLinkError as exc:
+            except PublicLinkError as exc:  # noqa: PERF203
                 last_error = exc
                 if (
                     exc.code

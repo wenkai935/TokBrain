@@ -11,8 +11,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR.joinpath("data")
-_LOCAL_FRONTENDS = ("http://127.0.0.1:3000", "http://localhost:3000")
-_DATA_SUBDIRECTORIES = ("media", "keyframes", "tmp", "source-assets", "package-imports")
+_LOCAL_FRONTENDS = (
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3001",
+    "http://localhost:3001",
+)
+_DATA_SUBDIRECTORIES = (
+    "media",
+    "keyframes",
+    "tmp",
+    "source-assets",
+    "package-imports",
+    # 统一 Cookie 库：data/cookies/<platform>.txt，设置页上传、各模块只读
+    "cookies",
+)
 
 
 class ApplicationSettings(BaseSettings):
@@ -26,7 +39,7 @@ class ApplicationSettings(BaseSettings):
 
     app_name: str = "TokBrain"
     app_host: Literal["127.0.0.1", "localhost"] = "127.0.0.1"
-    app_port: int = 8000
+    app_port: int = 8001
     debug: bool = False
     database_url: str = (
         "sqlite+aiosqlite:///" + DATA_DIR.joinpath("douyin_rag.db").as_posix()
@@ -39,6 +52,15 @@ class ApplicationSettings(BaseSettings):
     max_work_duration_seconds: int = Field(7_200, ge=30)
     max_download_megabytes: int = Field(1_024, ge=10)
     max_temp_megabytes: int = Field(2_048, ge=100)
+
+    # Optional: point at the ffmpeg ``bin`` directory when it is not on PATH.
+    # Startup also probes tools\ffmpeg\bin and common install roots, so this
+    # is only needed when the binary lives somewhere unusual.
+    ffmpeg_bin: str | None = None
+
+    import_batch_limit: int = Field(100, ge=1, le=1_000)
+    import_daily_limit: int = Field(150, ge=1, le=100_000)
+    inbox_batch_limit: int = Field(100, ge=1, le=1_000)
 
     scene_threshold: float = Field(0.40, ge=0.05, le=0.95)
     max_scene_candidates: int = Field(120, ge=12, le=1_000)
@@ -56,6 +78,14 @@ class ApplicationSettings(BaseSettings):
     rerank_model: str = "qwen3-rerank"
     embedding_dimensions: int = 1_024
 
+    # Provider decoupling: "dashscope" (default) or "openai" (any OpenAI-
+    # compatible endpoint). base_url/model overrides only apply to the
+    # "openai" provider type; dashscope keeps its own defaults above.
+    provider_type: str = "dashscope"
+    provider_base_url: str | None = None
+    provider_embedding_model: str | None = None
+    provider_chat_model: str | None = None
+
     @property
     def allowed_origins(self) -> list[str]:
         return list(
@@ -63,6 +93,14 @@ class ApplicationSettings(BaseSettings):
                 filter(None, map(str.strip, self.frontend_origins.split(",")))
             )
         )
+
+    @property
+    def database_path(self) -> Path:
+        """Local SQLite file path derived from ``database_url``."""
+        prefix = "sqlite+aiosqlite:///"
+        if self.database_url.startswith(prefix):
+            return Path(self.database_url[len(prefix) :])
+        return DATA_DIR / "douyin_rag.db"
 
 
 def _runtime_directories() -> tuple[Path, ...]:

@@ -30,6 +30,7 @@ class Reservation:
     works: int
     media_minutes: float
     llm_tokens: int
+    day: date | None = None
 
 
 def estimate_video_ingest_units(
@@ -126,7 +127,7 @@ async def reserve(
         ):
             raise BudgetExceeded("已达到今日音视频分钟上限")
         raise BudgetExceeded("已达到今日 AI 用量上限")
-    return Reservation(works, media_minutes, llm_tokens)
+    return Reservation(works, media_minutes, llm_tokens, day)
 
 
 async def consume(
@@ -141,7 +142,7 @@ async def consume(
         if actual_works is None
         else min(reservation.works, max(0, int(actual_works)))
     )
-    day = local_day()
+    day = reservation.day or local_day()
     await _ensure_counter(session, day)
     await session.execute(
         update(DailyBudget)
@@ -172,7 +173,7 @@ async def consume(
 
 
 async def release(session: AsyncSession, reservation: Reservation) -> None:
-    day = local_day()
+    day = reservation.day or local_day()
     await _ensure_counter(session, day)
     await session.execute(
         update(DailyBudget)

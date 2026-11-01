@@ -15,10 +15,10 @@ def unlink_with_retries(
     """Delete a temporary file without turning a Windows sharing lock into job failure."""
 
     for attempt in range(max(1, attempts)):
-        try:
+        try:  # each attempt must handle its own lock failure.
             path.unlink(missing_ok=True)
             return True
-        except PermissionError:
+        except PermissionError:  # noqa: PERF203
             if attempt + 1 >= attempts:
                 break
             # Some upload libraries release their file object only during GC.

@@ -14,6 +14,8 @@ from pathlib import Path
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from loguru import logger
+
 from app.config import DATA_DIR, settings
 from app.models import Keyframe, KnowledgeChunk, Work, WorkSourceAsset, WorkSummary
 from app.services.budget import record_usage
@@ -28,6 +30,7 @@ from app.services.keyframes import (
     probe_video_has_audio,
     probe_video_duration,
 )
+from app.services.model_profiles import dashscope_model_overrides, get_active_profile
 from app.services.pricing import PRICE_VERSION
 from app.services.providers import (
     DashScopeProvider,
@@ -38,6 +41,7 @@ from app.services.runtime_settings import get_runtime_settings
 from app.services.secrets import get_secret
 from app.services.summaries import local_asset_names, store_summary, summary_markdown
 from app.services.temp_files import unlink_with_retries
+from app.services.vector_store import ensure_vec0, replace_chunk_vectors
 
 
 def chunk_text(text: str, size: int = 1200, overlap: int = 160) -> list[str]:
@@ -165,10 +169,10 @@ def _set_evidence_result(
 ) -> None:
     # These columns were introduced with the evidence migration. setattr keeps
     # lightweight test doubles compatible without weakening the persisted model.
-    setattr(work, "evidence_state", evidence_state)
-    setattr(work, "supplement_state", supplement_state)
-    setattr(work, "supplement_reason", supplement_reason)
-    setattr(work, "track_report", track_report)
+    work.evidence_state = evidence_state
+    work.supplement_state = supplement_state
+    work.supplement_reason = supplement_reason
+    work.track_report = track_report
 
 
 async def _download_first(
@@ -181,13 +185,13 @@ async def _download_first(
 
     last_error: DownloadError | None = None
     for url in dict.fromkeys(value for value in urls if value):
-        try:
+        try:  # try each fresh media candidate in order.
             return await download_media(
                 url,
                 target,
                 max_bytes=max_bytes,
             )
-        except DownloadError as exc:
+        except DownloadError as exc:  # noqa: PERF203
             await asyncio.to_thread(unlink_with_retries, target)
             last_error = exc
     if last_error:
@@ -228,7 +232,7 @@ def _promotion_queue(session: AsyncSession) -> list[_DirectoryPromotion]:
     queue = getattr(session, "_tokbrain_directory_promotions", None)
     if queue is None:
         queue = []
-        setattr(session, "_tokbrain_directory_promotions", queue)
+        session._tokbrain_directory_promotions = queue
     return queue
 
 
@@ -237,7 +241,7 @@ def _take_promotions(session: AsyncSession) -> list[_DirectoryPromotion]:
     if isinstance(info, dict):
         return list(info.pop(_DIRECTORY_PROMOTIONS_KEY, []))
     queue = list(getattr(session, "_tokbrain_directory_promotions", []))
-    setattr(session, "_tokbrain_directory_promotions", [])
+    session._tokbrain_directory_promotions = []
     return queue
 
 
@@ -270,9 +274,9 @@ async def rollback_file_promotions(session: AsyncSession) -> None:
 
     errors: list[Exception] = []
     for promotion in reversed(_take_promotions(session)):
-        try:
+        try:  # every promotion must be rolled back independently.
             await asyncio.to_thread(promotion.rollback)
-        except Exception as exc:  # pragma: no cover - exceptional filesystem damage
+        except Exception as exc:  # pragma: no cover - exceptional filesystem damage  # noqa: PERF203
             errors.append(exc)
     if errors:
         raise RuntimeError("无法回滚媒体文件代际") from errors[0]
@@ -589,14 +593,14 @@ async def _restricted_text_or_audio(
 
     subtitle_path = DATA_DIR / "tmp" / f"{work.platform_work_id}.subtitle"
     for url in _policy_strings(policy, "subtitle_urls"):
-        try:
+        try:  # subtitle sources are optional; fall through on failure.
             await download_subtitle(url, subtitle_path)
             text = await asyncio.to_thread(_subtitle_file_text, subtitle_path)
             if text:
                 return "subtitle", text, None
-        except PublicLinkError:
+        except PublicLinkError:  # noqa: PERF203
             raise
-        except DownloadError:
+        except DownloadError:  # noqa: PERF203
             # Subtitle endpoints are optional and short-lived; continue with
             # the next permitted source when one is unavailable.
             pass
@@ -632,7 +636,15 @@ async def process_work(
     job_id: str,
 ) -> str:
     """Process one work without allowing metadata to masquerade as evidence."""
-    api_key = await get_secret(session, "dashscope_api_key")
+    profile = await get_active_profile(session)
+    if str(profile.get("provider_type") or "dashscope") != "dashscope":
+        raise RuntimeError(
+            "当前活动的 OpenAI 兼容配置不支持 ASR、OCR、关键帧和媒体总结；"
+            "请切换到百炼配置后重试"
+        )
+    api_key = await get_secret(session, str(profile["api_key_ref"]))
+    if not api_key and profile.get("builtin"):
+        api_key = await get_secret(session, "dashscope_api_key")
     metadata_text = "\n".join(
         value
         for value in (
@@ -644,11 +656,13 @@ async def process_work(
     )
     if not api_key:
         if getattr(work, "evidence_state", "unverified") != "sufficient":
-            setattr(work, "evidence_state", "unverified")
+            work.evidence_state = "unverified"
         work.processing_state = "waiting_for_key"
         return "waiting_for_key"
 
-    provider = DashScopeProvider(api_key)
+    provider = DashScopeProvider(
+        api_key, **await dashscope_model_overrides(session)
+    )
     runtime = await get_runtime_settings(session)
     material: list[tuple[str, str, float | None]] = [("metadata", metadata_text, None)]
     pending_usages: list[ProviderUsage] = []
@@ -1205,10 +1219,11 @@ async def _replace_chunks(
     await session.execute(
         delete(KnowledgeChunk).where(KnowledgeChunk.work_id == work.id)
     )
+    added: list[KnowledgeChunk] = []
     for index, (source_kind, text, timestamp) in enumerate(chunks):
         if not text:
             continue
-        session.add(
+        added.append(
             KnowledgeChunk(
                 work_id=work.id,
                 chunk_index=index,
@@ -1216,6 +1231,18 @@ async def _replace_chunks(
                 text=text,
                 start_seconds=timestamp,
                 end_seconds=timestamp,
-                embedding=vectors[index] if vectors and index < len(vectors) else None,
+                embedding=(
+                    vectors[index] if vectors and index < len(vectors) else None
+                ),
             )
         )
+    session.add_all(added)
+    await session.flush()
+    try:
+        if await ensure_vec0(session):
+            await replace_chunk_vectors(
+                session,
+                [(chunk.id, work.id, chunk.embedding) for chunk in added],
+            )
+    except Exception as exc:
+        logger.warning("同步向量索引失败（不影响知识库写入）: {}", exc)

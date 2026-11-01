@@ -53,6 +53,9 @@ async def create_batch(
         batch, item_ids, rejected_count = await create_import_batch(
             session,
             payload.text,
+            metadata_only=payload.metadata_only,
+            title=payload.title,
+            author=payload.author,
         )
     except PublicLinkError as exc:
         code = (

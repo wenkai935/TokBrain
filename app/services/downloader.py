@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 from pathlib import Path
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from urllib.parse import urljoin
 
 import httpx
@@ -153,7 +153,7 @@ async def download_media(
                                     "response_too_large",
                                     "媒体下载过程中超过大小上限",
                                 )
-                            output.write(chunk)
+                            await asyncio.to_thread(output.write, chunk)
                     return target
         raise DownloadError("too_many_redirects", "媒体重定向次数过多")
 

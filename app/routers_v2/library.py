@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import uuid
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -340,21 +341,45 @@ async def add_works_to_collection(
 
 @router.get("/works")
 async def works(
-    library_state: str = Query(
-        default="in_library",
-        pattern="^(pending|in_library|issues|archived|supplement)$",
-    ),
+    library_state: Annotated[
+        str,
+        Query(pattern="^(pending|in_library|issues|archived|supplement)$"),
+    ] = "in_library",
     collection_id: int | None = None,
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=60, ge=1, le=200),
+    lid: Annotated[
+        str | None, Query(description="按数据唯一标识 LID 精确过滤")
+    ] = None,
+    platform: Annotated[
+        str | None, Query(description="按平台过滤 douyin/bilibili/xiaohongshu")
+    ] = None,
+    kind: Annotated[
+        str | None, Query(description="按媒体类型过滤 video/image")
+    ] = None,
+    author: Annotated[str | None, Query(description="按作者名精确过滤")] = None,
+    source: Annotated[str | None, Query(description="按导入来源过滤")] = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 60,
     session: AsyncSession = Depends(get_db),
 ):
+    # Defaults must be plain values, not Query(...) instances: this handler is
+    # also called directly from tests, where omitted filters would otherwise
+    # arrive as FieldInfo objects and leak into the SQL parameters.
     state = _state_filter(library_state)
     query = (
         select(Work).where(Work.supplement_state != "none")
         if state == "supplement"
         else select(Work).where(Work.library_state == state)
     )
+    if lid:
+        query = query.where(Work.lid == lid)
+    if platform:
+        query = query.where(Work.platform == platform)
+    if kind:
+        query = query.where(Work.kind == kind)
+    if author:
+        query = query.where(Work.author_name == author)
+    if source:
+        query = query.where(Work.import_source == source)
     if state == "in_library":
         query = query.where(
             Work.processing_state == "processed",
@@ -425,8 +450,10 @@ async def works(
         items.append(
             {
                 "id": work.id,
+                "platform": work.platform,
                 "platform_work_id": work.platform_work_id,
                 "kind": work.kind,
+                "import_source": work.import_source,
                 "title": work.title,
                 "author_name": work.author_name,
                 "duration_seconds": work.duration_seconds,
@@ -723,10 +750,10 @@ async def _active_job_for_work(session: AsyncSession, work_id: int) -> Job | Non
     for job in jobs:
         scope = job.scope if isinstance(job.scope, dict) else {}
         for value in scope.get("work_ids") or []:
-            try:
+            try:  # tolerate non-numeric ids inside a scope list.
                 if int(value) == work_id:
                     return job
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # noqa: PERF203
                 continue
     return None
 

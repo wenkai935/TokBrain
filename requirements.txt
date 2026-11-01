@@ -15,6 +15,8 @@ openai==1.59.7
 dashscope==1.20.0
 Pillow==12.3.0
 tzdata==2025.2
+# Local vector index (SQLite extension) for RAG retrieval
+sqlite-vec==0.1.9
 
 # F2 runtime compatibility dependencies. F2 itself is installed with
 # --no-deps into .vendor/ by scripts/setup.ps1 because its 0.0.1.7 package

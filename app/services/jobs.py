@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import suppress
 
 from loguru import logger
 from sqlalchemy import and_, func, or_, select, update
@@ -38,6 +39,7 @@ from app.services.collection_prompts import summary_prompt_for_work
 from app.services.errors import classify_error, safe_error_message
 from app.services.f2_links import F2WorkClient, PublicLinkError
 from app.services.import_queue import open_f2_circuit, resolve_submitted_link
+from app.services.model_profiles import dashscope_model_overrides, get_active_profile
 from app.services.pricing import PRICE_VERSION
 from app.services.providers import DashScopeProvider, SUMMARY_MAX_OUTPUT_TOKENS
 from app.services.runtime_settings import get_runtime_settings
@@ -168,9 +170,9 @@ async def _active_work_ids(session: AsyncSession) -> set[int]:
         if not isinstance(scope, dict):
             continue
         for value in scope.get("work_ids") or []:
-            try:
+            try:  # tolerate non-numeric ids inside a scope list.
                 result.add(int(value))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # noqa: PERF203
                 continue
     return result
 
@@ -380,7 +382,7 @@ async def enqueue_ingest_job(session: AsyncSession, work_ids: list[int]) -> Job:
 async def _enqueue_ingest_job(
     session: AsyncSession, work_ids: list[int]
 ) -> Job:
-    requested = sorted(set(int(item) for item in work_ids))
+    requested = sorted({int(item) for item in work_ids})
     active_work_ids = await _active_work_ids(session)
     requested = [work_id for work_id in requested if work_id not in active_work_ids]
     valid = list(
@@ -442,7 +444,7 @@ async def enqueue_summary_job(session: AsyncSession, work_ids: list[int]) -> Job
 async def _enqueue_summary_job(
     session: AsyncSession, work_ids: list[int]
 ) -> Job:
-    requested = sorted(set(int(item) for item in work_ids))
+    requested = sorted({int(item) for item in work_ids})
     active_work_ids = await _active_work_ids(session)
     requested = [work_id for work_id in requested if work_id not in active_work_ids]
     valid = list(
@@ -498,6 +500,40 @@ async def cancel_job(session: AsyncSession, job_id: str) -> Job:
         raise ValueError("该任务已经结束，不能再次停止")
     await _commit_transaction(session)
     return job
+
+
+async def retry_failed_imports(session: AsyncSession) -> dict:
+    """Re-enqueue failed import works for reprocessing.
+
+    A work is retryable when its last ingest attempt failed
+    (processing_state == "failed") and it is still in a state the ingest
+    pipeline can accept (pending / issues / in_library / archived).
+    """
+
+    failed_ids = list(
+        (
+            await session.execute(
+                select(Work.id).where(
+                    Work.processing_state == "failed",
+                    Work.library_state.in_(
+                        {"pending", "issues", "in_library", "archived"}
+                    ),
+                )
+            )
+        ).scalars()
+    )
+    if not failed_ids:
+        return {"job_id": None, "retried": 0, "message": "没有可重试的失败导入"}
+    try:
+        job = await enqueue_ingest_job(session, failed_ids)
+    except ValueError:
+        # Candidates are already queued or otherwise not re-ingestable right now.
+        return {"job_id": None, "retried": 0, "message": "没有可重试的失败导入"}
+    return {
+        "job_id": job.id,
+        "retried": job.total_items,
+        "message": f"已重新排入 {job.total_items} 个失败导入",
+    }
 
 
 async def _is_cancelling(session: AsyncSession, job: Job) -> bool:
@@ -867,10 +903,19 @@ async def _summarize_works(session: AsyncSession, job: Job) -> bool:
         .scalars()
         .all()
     )
-    api_key = await get_secret(session, "dashscope_api_key")
+    profile = await get_active_profile(session)
+    if str(profile.get("provider_type") or "dashscope") != "dashscope":
+        raise RuntimeError(
+            "当前活动的 OpenAI 兼容配置不支持媒体总结；请切换到百炼配置后重试"
+        )
+    api_key = await get_secret(session, str(profile["api_key_ref"]))
+    if not api_key and profile.get("builtin"):
+        api_key = await get_secret(session, "dashscope_api_key")
     if not api_key:
         raise RuntimeError("请先在设置中配置模型 API Key")
-    provider = DashScopeProvider(api_key)
+    provider = DashScopeProvider(
+        api_key, **await dashscope_model_overrides(session)
+    )
     runtime = await get_runtime_settings(session)
     job.total_items = len(rows)
     for index, work in enumerate(rows):
@@ -1149,10 +1194,8 @@ class JobCoordinator:
             except Exception as exc:
                 self.last_error = safe_error_message(exc)
                 logger.exception("本地处理 worker 轮询失败，将在稍后重试")
-            try:
+            with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.stop_event.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                pass
 
 
 coordinator = JobCoordinator()

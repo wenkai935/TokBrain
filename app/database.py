@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.config import ensure_directories, settings
 from app.models import Base
 from app.services.migrations import finalize_database, prepare_database
+from app.services.vector_store import ensure_chunk_vec_sync
 
 
 class DatabaseRuntime:
@@ -46,6 +47,9 @@ class DatabaseRuntime:
         await asyncio.to_thread(prepare_database)
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        # Fresh databases (or databases where migration v11 was skipped because
+        # sqlite-vec was unavailable) get the vec index built here, idempotently.
+        await asyncio.to_thread(ensure_chunk_vec_sync, settings.database_path)
         await asyncio.to_thread(finalize_database)
 
     async def dispose(self) -> None:

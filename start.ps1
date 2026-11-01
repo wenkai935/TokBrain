@@ -6,7 +6,7 @@ $DataPath = Join-Path $WorkspacePath "data"
 $LogPath = Join-Path $DataPath "logs"
 $StatePath = Join-Path $DataPath "runtime.json"
 $BackendPython = Join-Path $WorkspacePath ".venv\Scripts\python.exe"
-$FrontendPort = 3000
+$FrontendPort = 3001
 $FrontendHost = "127.0.0.1"
 $LocalUrl = "http://${FrontendHost}:$FrontendPort"
 Set-Location $WorkspacePath
@@ -15,12 +15,92 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:NODE_ENV = "production"
 
-# Some launchers expose both PATH and Path. Windows PowerShell's Start-Process
-# builds a case-insensitive environment dictionary and otherwise aborts before
-# either local service is started.
-$ProcessPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
-[Environment]::SetEnvironmentVariable("Path", $null, "Process")
-[Environment]::SetEnvironmentVariable("PATH", $ProcessPath, "Process")
+# Some launchers expose the same variable twice with different casing (PATH and
+# Path, http_proxy and HTTP_PROXY). Windows PowerShell's Start-Process builds a
+# case-insensitive environment dictionary and otherwise aborts before either
+# local service is started, so collapse each duplicate to a single entry.
+$EnvironmentNames = @([Environment]::GetEnvironmentVariables("Process").Keys)
+$SettledNames = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($VariableName in $EnvironmentNames) {
+    $Name = [string]$VariableName
+    if (-not $SettledNames.Add($Name.ToLowerInvariant())) {
+        continue
+    }
+    foreach ($Candidate in $EnvironmentNames) {
+        $CandidateName = [string]$Candidate
+        if ($CandidateName -cne $Name -and
+            [string]::Equals(
+                $CandidateName, $Name, [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            [Environment]::SetEnvironmentVariable($CandidateName, $null, "Process")
+        }
+    }
+}
+
+# Locate FFmpeg without hard-coding one machine's install path. Order:
+#   $env:FFMPEG_BIN / $env:TOKBRAIN_FFMPEG_BIN -> ffmpeg already on PATH ->
+#   project tools\ffmpeg\bin -> unpacked ffmpeg*\bin beside the workspace and
+#   on the usual C:/D: roots.
+$FFmpegBin = $null
+foreach ($Candidate in @($env:FFMPEG_BIN, $env:TOKBRAIN_FFMPEG_BIN)) {
+    if (-not $Candidate) {
+        continue
+    }
+    if (Test-Path -LiteralPath (Join-Path $Candidate "ffmpeg.exe")) {
+        $FFmpegBin = $Candidate
+        break
+    }
+    if (Test-Path -LiteralPath (Join-Path $Candidate "bin\ffmpeg.exe")) {
+        $FFmpegBin = Join-Path $Candidate "bin"
+        break
+    }
+}
+if (-not $FFmpegBin) {
+    $ExistingFFmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($ExistingFFmpeg) {
+        $FFmpegBin = Split-Path -Parent $ExistingFFmpeg.Source
+    }
+}
+if (-not $FFmpegBin) {
+    $FFmpegSearchPaths = @(
+        (Join-Path $WorkspacePath "tools\ffmpeg\bin"),
+        (Join-Path $WorkspacePath "ffmpeg\bin"),
+        (Join-Path (Split-Path -Parent $WorkspacePath) "ffmpeg*\bin"),
+        "C:\ffmpeg\bin",
+        "C:\ffmpeg*\bin",
+        "D:\ffmpeg*\bin",
+        "D:\code\ffmpeg*\bin",
+        "D:\tools\ffmpeg*\bin",
+        "D:\tokbrain-release\ffmpeg\bin"
+    )
+    foreach ($SearchPath in $FFmpegSearchPaths) {
+        # Get-ChildItem -Filter does not expand wildcards in the -Path tail,
+        # so resolve the directory first and then probe for the executable.
+        foreach ($Directory in @(Get-Item -Path $SearchPath -ErrorAction SilentlyContinue |
+                Sort-Object -Property FullName -Descending)) {
+            if (Test-Path -LiteralPath (Join-Path $Directory.FullName "ffmpeg.exe")) {
+                $FFmpegBin = $Directory.FullName
+                break
+            }
+        }
+        if ($FFmpegBin) {
+            break
+        }
+    }
+}
+if ($FFmpegBin) {
+    $env:PATH = "$FFmpegBin;$env:PATH"
+    if (-not $env:FFMPEG_BIN) {
+        $env:FFMPEG_BIN = $FFmpegBin
+    }
+    Write-Host "FFmpeg: $FFmpegBin" -ForegroundColor DarkGray
+}
+else {
+    Write-Warning (
+        "未找到 ffmpeg/ffprobe，视频将无法进入完整处理流水线。" +
+        "请安装 ffmpeg 并加入 PATH，或设置环境变量 FFMPEG_BIN 指向其 bin 目录。"
+    )
+}
 
 function Get-TextSha256 {
     param([AllowEmptyString()][string]$Value)
@@ -73,6 +153,89 @@ function Get-ProcessIdentity {
         executable_path = [System.IO.Path]::GetFullPath($ExecutablePath)
         command_line_sha256 = $CommandLineSha256
     }
+}
+
+function Start-ProcessWatchdog {
+    <#
+    .SYNOPSIS
+        Launch a detached hidden PowerShell process that waits for the parent
+        to exit and then forcibly terminates the supplied child process IDs.
+    .DESCRIPTION
+        This covers the "parent killed without running finally" gap that Job
+        Objects normally fill. If a Job Object cannot be created (because the
+        parent is already in a job, as is common for cmd/powershell on Windows),
+        the watchdog becomes the primary cleanup mechanism. It exits on its own
+        once all children are already gone.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$ParentProcessId,
+        [Parameter(Mandatory = $true)][int[]]$ChildProcessIds,
+        [Parameter(Mandatory = $true)][string]$LogDirectory,
+        [Parameter(Mandatory = $true)][string]$ScriptPath
+    )
+
+    $ValidChildren = $ChildProcessIds |
+        Where-Object { $_ -gt 0 } |
+        Select-Object -Unique
+    if (-not $ValidChildren) {
+        return $null
+    }
+
+    $ChildList = ($ValidChildren -join ",")
+    $TempPath = $ScriptPath
+    $ScriptContent = @'
+param(
+    [Parameter(Mandatory = $true)][int]$ParentPid,
+    [Parameter(Mandatory = $true)][string]$ChildrenCsv,
+    [Parameter(Mandatory = $true)][string]$LogDirectory
+)
+
+$Children = $ChildrenCsv -split "," | ForEach-Object {
+    $Value = 0
+    [int]::TryParse($_, [ref] $Value) | Out-Null
+    $Value
+} | Where-Object { $_ -gt 0 }
+
+$LogPath = Join-Path $LogDirectory "watchdog.log"
+function Write-WatchdogLog {
+    param([string]$Message)
+    Add-Content -Path $LogPath -Value "$(Get-Date -Format o) $Message" -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+Write-WatchdogLog "watchdog started for parent $ParentPid, children $($Children -join ',')"
+while ($true) {
+    $Parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    if (-not $Parent) {
+        Write-WatchdogLog "parent $ParentPid gone; terminating children"
+        foreach ($ChildPid in $Children) {
+            if ($ChildPid -gt 0) {
+                try { taskkill /F /T /PID $ChildPid 2>$null } catch {}
+            }
+        }
+        exit
+    }
+    $Alive = $Children | Where-Object { (Get-Process -Id $_ -ErrorAction SilentlyContinue) }
+    if (-not $Alive) {
+        Write-WatchdogLog "all children gone; watchdog exiting"
+        exit
+    }
+    Start-Sleep -Milliseconds 500
+}
+'@
+    Set-Content -Path $TempPath -Value $ScriptContent -Encoding UTF8 -Force
+
+    $ArgumentList = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-WindowStyle", "Hidden",
+        "-File", $TempPath,
+        "-ParentPid", [string]$ParentProcessId,
+        "-ChildrenCsv", $ChildList,
+        "-LogDirectory", $LogDirectory
+    )
+    return Start-Process -FilePath "powershell.exe" `
+        -ArgumentList $ArgumentList `
+        -PassThru -WindowStyle Hidden
 }
 
 function Test-ProcessIdentity {
@@ -128,6 +291,96 @@ function Stop-OwnedProcessTree {
     }
 }
 
+function Start-FeishuBridge {
+    # 设计初衷：开服务即在轮询飞书表（手机 → 飞书 AI → 多维表格 → 本机处理）。
+    # 启停逻辑复用 tokbrain_control.bridge：CIM 精确匹配进程、注入表 ID 与
+    # NO_PROXY（绕系统代理），脚本里不再写第二份。
+    # 失败只报警告：飞书不是 TokBrain 的启动前提，缺 lark-cli 授权也不该挡住服务。
+    if ($env:TOKBRAIN_AUTOSTART_BRIDGE -eq "0") {
+        Write-Host "  飞书同步桥：已按 TOKBRAIN_AUTOSTART_BRIDGE=0 跳过" -ForegroundColor DarkGray
+        return
+    }
+    if (-not (Test-Path -LiteralPath $BackendPython)) {
+        return
+    }
+    try {
+        $Raw = & $BackendPython -m tokbrain_control sync start --json 2>&1
+        $Payload = ($Raw -join "`n") | ConvertFrom-Json
+        $Data = $Payload.data
+        if ($Data -and $Data.started) {
+            Write-Host "  飞书同步桥：已启动（pid $($Data.pid)）" -ForegroundColor Green
+        }
+        elseif ($Data -and $Data.already_running) {
+            Write-Host "  飞书同步桥：已在运行，未重复启动" -ForegroundColor DarkGray
+        }
+        else {
+            $Reason = if ($Payload.error) { $Payload.error.message } else { "未知原因" }
+            Write-Host "  飞书同步桥：未启动（$Reason）" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Warning "飞书同步桥未能启动：$($_.Exception.Message)。服务本身不受影响。"
+    }
+}
+
+function New-ProcessTreeJob {
+    # Returns a job object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, or Zero when
+    # this process already belongs to a job that forbids nesting.
+    if (-not ('TokBrainJobObject' -as [type])) {
+        $JobDefinition = @'
+using System;
+using System.Runtime.InteropServices;
+public static class TokBrainJobObject {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, int length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    public static IntPtr Create() {
+        IntPtr job = CreateJobObjectW(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) { return IntPtr.Zero; }
+        JOBOBJECT_BASIC_LIMIT_INFORMATION limits = new JOBOBJECT_BASIC_LIMIT_INFORMATION();
+        limits.LimitFlags = 0x00002000;
+        int size = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_LIMIT_INFORMATION));
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+            Marshal.StructureToPtr(limits, buffer, false);
+            if (!SetInformationJobObject(job, 2, buffer, size)) { return IntPtr.Zero; }
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+        return job;
+    }
+    public static bool Assign(IntPtr job, int processId) {
+        try {
+            return AssignProcessToJobObject(job, System.Diagnostics.Process.GetProcessById(processId).Handle);
+        }
+        catch { return false; }
+    }
+}
+'@
+        try {
+            Add-Type -TypeDefinition $JobDefinition -ErrorAction Stop
+        }
+        catch {
+            return [IntPtr]::Zero
+        }
+    }
+    return [TokBrainJobObject]::Create()
+}
+
 function Get-ListeningProcessId {
     param([Parameter(Mandatory = $true)][int]$Port)
 
@@ -166,8 +419,8 @@ function Repair-StaleRuntimeState {
             }
         }
         if (-not $RecordedState.PSObject.Properties["state_version"]) {
-            [void]$PortsToCheck.Add(8000)
-            [void]$PortsToCheck.Add(3000)
+            [void]$PortsToCheck.Add(8001)
+            [void]$PortsToCheck.Add(3001)
         }
     }
     catch {
@@ -313,12 +566,14 @@ if (Test-Path -LiteralPath $FrontendBuildStatePath -PathType Leaf) {
         throw "APP_HOST/APP_PORT 已在安装后改变；请重新运行 .\scripts\setup.ps1 以更新前端构建。"
     }
 }
-elseif ($BackendUrl -ne "http://127.0.0.1:8000") {
+elseif ($BackendUrl -ne "http://127.0.0.1:8001") {
     throw "自定义 APP_HOST/APP_PORT 缺少对应的前端构建信息；请重新运行 .\scripts\setup.ps1。"
 }
 
 New-Item -ItemType Directory -Force -Path $DataPath | Out-Null
 New-Item -ItemType Directory -Force -Path $LogPath | Out-Null
+Get-ChildItem -Path $LogPath -Filter "watchdog-*.ps1" -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 
 Repair-StaleRuntimeState -CurrentBackendPort $BackendPort `
     -CurrentFrontendPort $FrontendPort
@@ -336,7 +591,8 @@ $BackendLauncherIdentity = $null
 $FrontendLauncherIdentity = $null
 $BackendListenerIdentity = $null
 $FrontendListenerIdentity = $null
-$StartupComplete = $false
+$Watchdog = $null
+$WatchdogScriptPath = $null
 
 try {
     $Backend = Start-Process -FilePath $BackendPython -ArgumentList (
@@ -359,6 +615,41 @@ try {
     $FrontendLauncherIdentity = Get-ProcessIdentity -ProcessId $Frontend.Id
     if (-not $FrontendLauncherIdentity) {
         throw "前端启动后无法记录进程身份。"
+    }
+
+    # Job membership is inherited by every descendant, so one assignment per
+    # launcher covers the whole tree (npm -> node, uvicorn -> workers).
+    $ServiceJob = New-ProcessTreeJob
+    $JobObjectFailed = $true
+    if ($ServiceJob -ne [IntPtr]::Zero) {
+        $BackendAssigned = [TokBrainJobObject]::Assign($ServiceJob, $Backend.Id)
+        $FrontendAssigned = [TokBrainJobObject]::Assign($ServiceJob, $Frontend.Id)
+        if ($BackendAssigned -and $FrontendAssigned) {
+            $JobObjectFailed = $false
+        }
+        else {
+            Write-Warning "无法将服务进程加入作业对象（本进程可能已受其他作业约束）。"
+        }
+    }
+    else {
+        Write-Warning "无法创建作业对象（本进程可能已受其他作业约束）。"
+    }
+
+    # Fallback / additional guard: a detached hidden watchdog that kills the
+    # child tree if this parent dies without running its finally block. This is
+    # needed because Windows often places cmd/powershell in an existing job,
+    # making AssignProcessToJobObject fail even outside the sandbox.
+    $WatchdogScriptPath = Join-Path $LogPath "watchdog-$([guid]::NewGuid()).ps1"
+    $Watchdog = Start-ProcessWatchdog `
+        -ParentProcessId $PID `
+        -ChildProcessIds @($Backend.Id, $Frontend.Id) `
+        -LogDirectory $LogPath `
+        -ScriptPath $WatchdogScriptPath
+    if (-not $Watchdog) {
+        throw "无法创建进程看门狗，也不能依赖作业对象；启动中止。"
+    }
+    if ($JobObjectFailed) {
+        Write-Host "已启动独立看门狗（PID $($Watchdog.Id)）作为兜底；父进程异常退出时将自动清理服务。" -ForegroundColor Yellow
     }
 
     $Ready = $false
@@ -432,23 +723,35 @@ try {
         frontend_launcher = $FrontendLauncherIdentity
     }
     Write-AtomicJson -Path $StatePath -Value $RuntimeState
-    $StartupComplete = $true
+
+    Write-Host "TokBrain $AppVersion 已启动：$LocalUrl。关闭服务请双击‘停止.cmd’。" -ForegroundColor Green
+    Start-FeishuBridge
+    if ($env:TOKBRAIN_SKIP_LOCAL_UI_OPEN -ne "1") {
+        try {
+            Start-Process -FilePath $LocalUrl
+        }
+        catch {
+            Write-Warning "本地网页未能自动打开，请手动访问 $LocalUrl。"
+        }
+    }
+
+    # Supervise the tree: the job object kills every descendant even when this
+    # launcher is killed. The loop ends when a service exits or when 停止.cmd
+    # removes the runtime state.
+    while (-not $Backend.HasExited -and -not $Frontend.HasExited -and
+           (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
+        Start-Sleep -Seconds 1
+    }
 }
 finally {
-    if (-not $StartupComplete) {
-        Stop-OwnedProcessTree -Identity $FrontendListenerIdentity
-        Stop-OwnedProcessTree -Identity $FrontendLauncherIdentity
-        Stop-OwnedProcessTree -Identity $BackendListenerIdentity
-        Stop-OwnedProcessTree -Identity $BackendLauncherIdentity
+    Stop-OwnedProcessTree -Identity $FrontendListenerIdentity
+    Stop-OwnedProcessTree -Identity $FrontendLauncherIdentity
+    Stop-OwnedProcessTree -Identity $BackendListenerIdentity
+    Stop-OwnedProcessTree -Identity $BackendLauncherIdentity
+    if ($Watchdog) {
+        Stop-Process -Id $Watchdog.Id -Force -ErrorAction SilentlyContinue
     }
-}
-
-Write-Host "TokBrain $AppVersion 已启动：$LocalUrl。关闭服务请双击‘停止.cmd’。" -ForegroundColor Green
-if ($env:TOKBRAIN_SKIP_LOCAL_UI_OPEN -ne "1") {
-    try {
-        Start-Process -FilePath $LocalUrl
-    }
-    catch {
-        Write-Warning "本地网页未能自动打开，请手动访问 $LocalUrl。"
+    if ($WatchdogScriptPath -and (Test-Path -LiteralPath $WatchdogScriptPath)) {
+        Remove-Item -Path $WatchdogScriptPath -Force -ErrorAction SilentlyContinue
     }
 }

@@ -23,21 +23,24 @@ class SettingsView(BaseModel):
     dpapi_warning: str
     has_dashscope_key: bool
     has_bss_credentials: bool
-    has_f2_cookie: bool = False
+    has_f2_cookie: bool = False  # deprecated: Douyin discovery moved to zhicui (douyin_cookie)
+    has_douyin_cookie: bool = False
+    has_bilibili_cookie: bool = False
+    has_xhs_cookie: bool = False
     security_cleanup_required: bool = False
     security_cleanup_message: str = ""
-    default_answer_format: Literal["rich", "markdown", "plain"] = "rich"
     summary_prompt: str
     default_summary_prompt: str
     processing_model: str
+    processing_model_options: list[str] = Field(default_factory=list)
     chat_fast_model: str
     chat_deep_model: str
-    processing_model_options: list[str] = Field(default_factory=list)
     chat_model_options: list[str] = Field(default_factory=list)
+    default_answer_format: str
     ocr_model: str
     asr_model: str
     embedding_model: str
-    import_batch_limit: int = 10
+    import_batch_limit: int = 100
     import_daily_limit: int = 150
     import_worker_count: int = 3
     import_network_concurrency: int = 1
@@ -56,13 +59,22 @@ class SettingsUpdate(BaseModel):
     dashscope_api_key: str | None = Field(default=None, max_length=500)
     bss_access_key_id: str | None = Field(default=None, max_length=200)
     bss_access_key_secret: str | None = Field(default=None, max_length=500)
-    f2_cookie: str | None = Field(default=None, max_length=20000)
+    f2_cookie: str | None = Field(default=None, max_length=20000)  # deprecated
     clear_f2_cookie: bool = False
-    default_answer_format: Literal["rich", "markdown", "plain"] | None = None
+    douyin_cookie: str | None = Field(default=None, max_length=20000)
+    clear_douyin_cookie: bool = False
+    bilibili_cookie: str | None = Field(default=None, max_length=20000)
+    clear_bilibili_cookie: bool = False
+    xhs_cookie: str | None = Field(default=None, max_length=20000)
+    clear_xhs_cookie: bool = False
     summary_prompt: str | None = Field(default=None, min_length=1, max_length=12000)
     processing_model: str | None = Field(default=None, min_length=1, max_length=100)
     chat_fast_model: str | None = Field(default=None, min_length=1, max_length=100)
     chat_deep_model: str | None = Field(default=None, min_length=1, max_length=100)
+    default_answer_format: str | None = Field(default=None, max_length=20)
+    import_batch_limit: int | None = Field(default=None, ge=1, le=1000)
+    import_daily_limit: int | None = Field(default=None, ge=1, le=100000)
+    inbox_batch_limit: int | None = Field(default=None, ge=1, le=1000)
 
 
 class SystemProbe(BaseModel):
@@ -101,6 +113,11 @@ class UsageSummary(BaseModel):
 class ImportBatchCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=100000)
+    # 仅链接入库（不访问抖音，避免风控熔断）：跳过预检网络解析，直接用长链 +
+    # 可选元数据建 Work，后续可在网页补件。飞书→TokBrain 链路默认使用。
+    metadata_only: bool = False
+    title: str | None = Field(default=None, max_length=500)
+    author: str | None = Field(default=None, max_length=200)
 
 
 class ImportSelection(BaseModel):
@@ -294,33 +311,6 @@ class WorkSupplementUploadView(BaseModel):
     job: JobView
 
 
-class ChatTurn(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=12000)
-
-
-class ChatRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=4000)
-    top_k: int = Field(default=8, ge=1, le=20)
-    history: list[ChatTurn] = Field(default_factory=list, max_length=40)
-    mode: Literal["fast", "deep"] = "fast"
-
-
-class ChatSource(BaseModel):
-    work_id: int
-    platform_work_id: str
-    title: str
-    collection: str | None = None
-    timestamp_seconds: float | None = None
-    external_url: str | None = None
-    source_kind: str
-
-
-class ChatAnswer(BaseModel):
-    answer: str
-    sources: list[ChatSource]
-
-
 class SummaryCreate(BaseModel):
     work_ids: list[int] = Field(min_length=1, max_length=1000)
 
@@ -349,3 +339,47 @@ class RetryBatchRequest(BaseModel):
 
 class ObsidianManifestRequest(BaseModel):
     work_ids: list[int] = Field(min_length=1, max_length=1000)
+
+
+# ---------------------------------------------------------------------------
+# Inbound inbox API (/api/integrations/v1/inbox/items)
+# ---------------------------------------------------------------------------
+INBOX_SOURCES = ("douyin_share", "local_text")
+
+
+class InboxItemCreate(StrictImportRequest):
+    model_config = ConfigDict(extra="forbid")
+
+    # link defaults to "" so a missing link is reported as an invalid link
+    # (HTTP 400) by the endpoint rather than a 422 schema error (TC-P4-10).
+    link: str = Field(default="", max_length=2_000)
+    tags: str = Field(default="", max_length=2_000)
+    source: str = Field(default="douyin_share", pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    title: str | None = Field(default=None, max_length=500)
+
+
+class InboxIngestCreate(StrictImportRequest):
+    # rights_attested is intentionally a plain bool (default False) so the
+    # endpoint can return a 400 with a clear message rather than a 422 when the
+    # compliance flag is missing (TC-P4-06). It must be explicitly True.
+    rights_attested: bool = False
+    # The >100 cap is enforced in the endpoint (returns 400, atomic) rather than
+    # via pydantic max_length, so the documented rejection shape is a 400.
+    items: list[InboxItemCreate] = Field(min_length=1)
+
+
+class InboxItemResult(BaseModel):
+    record_id: str
+    link: str
+    normalized_link: str
+    source: str
+    status: str
+    error: ImportErrorDetail | None = None
+
+
+class InboxIngestResult(BaseModel):
+    accepted: int
+    duplicates: int = 0
+    rejected: int
+    items: list[InboxItemResult]
+    replayed: bool = False

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from weakref import WeakValueDictionary
@@ -182,7 +183,7 @@ async def _save_upload(upload: Any, directory: Path) -> dict:
                 if size > VIDEO_LIMIT:
                     raise LocalAssetError("file_too_large", "单个文件超过 1 GB 上限")
                 digest.update(chunk)
-                output.write(chunk)
+                await asyncio.to_thread(output.write, chunk)
         kind, extension, mime_type = _kind_and_extension(header)
         if kind == "image" and size > IMAGE_LIMIT:
             raise LocalAssetError("file_too_large", "单张图片超过 30 MB 上限")
@@ -236,7 +237,8 @@ async def store_local_assets(
     saved: list[dict] = []
     try:
         for upload in uploads:
-            saved.append(await _save_upload(upload, directory))
+            # Comprehension would lose partial-save cleanup on failure.
+            saved.append(await _save_upload(upload, directory))  # noqa: PERF401
         kinds = {row["kind"] for row in saved}
         if kinds == {"video"} and len(saved) != 1:
             raise LocalAssetError("unsupported_media", "视频补件只能上传一个文件")
@@ -310,12 +312,10 @@ async def store_local_assets(
 
     # The old rows are no longer reachable only after the replacement is durable.
     for old_path in old_paths:
-        try:
-            old_path.unlink(missing_ok=True)
-        except OSError:
+        with suppress(OSError):
             # A transient Windows file lock must not turn a committed replacement
             # into an API failure. The orphan can be removed by later maintenance.
-            pass
+            old_path.unlink(missing_ok=True)
     return item
 
 
@@ -368,7 +368,8 @@ async def store_work_supplement(
         saved: list[dict] = []
         try:
             for upload in uploads:
-                saved.append(await _save_upload(upload, directory))
+                # Comprehension would lose partial-save cleanup on failure.
+                saved.append(await _save_upload(upload, directory))  # noqa: PERF401
             if any(row["kind"] != expected_kind for row in saved):
                 raise LocalAssetError(
                     "unsupported_media",
@@ -475,12 +476,10 @@ async def store_work_supplement(
 
         if not idempotent:
             for old_path in old_paths:
-                try:
-                    old_path.unlink(missing_ok=True)
-                except OSError:
+                with suppress(OSError):
                     # The replacement is already durable. A transient Windows
                     # file lock must not make the successful upload look failed.
-                    pass
+                    old_path.unlink(missing_ok=True)
         return work, {
             "asset_count": len(saved),
             "sha256": [str(row["sha256"]) for row in saved],
@@ -671,10 +670,8 @@ async def _store_import_video(
         item.error_message = None
         await session.commit()
         for old_path in old_paths:
-            try:
+            with suppress(OSError):
                 old_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         return item, {
             "sha256": actual_sha,
             "duration_seconds": item.duration_seconds,

@@ -14,11 +14,12 @@ from sqlalchemy import create_engine
 
 from app.config import DATA_DIR
 from app.models import Base
+from app.services.vector_store import ensure_chunk_vec_sync
 
 
 DB_PATH = DATA_DIR / "douyin_rag.db"
 SCHEMA_KEY = "schema"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 REMOVED_SETTING_KEYS = {
     "active_account",
     "adapter_health_state",
@@ -87,7 +88,7 @@ def _rows(connection: sqlite3.Connection, table: str) -> list[dict]:
         return []
     cursor = connection.execute(f'SELECT * FROM "{table}"')
     names = [item[0] for item in cursor.description or []]
-    return [dict(zip(names, row)) for row in cursor.fetchall()]
+    return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
 
 def _insert(
@@ -567,8 +568,13 @@ def migrate_to_v9(path: Path = DB_PATH) -> None:
                         (work_id,),
                     )
 
+                # `row` is a sqlite3.Row: it supports indexing and `.keys()` but
+                # has neither `.get()` nor `key in row` (`__contains__`), so the
+                # presence checks must use `.keys()`.
                 metadata = _json_dict(
-                    row["raw_metadata"] if "raw_metadata" in row.keys() else None
+                    row["raw_metadata"]
+                    if "raw_metadata" in row.keys()  # noqa: SIM118
+                    else None
                 )
                 media_policy = metadata.get("media_policy")
                 permission = (
@@ -577,9 +583,12 @@ def migrate_to_v9(path: Path = DB_PATH) -> None:
                     else "unknown"
                 )
                 restricted_video = (
-                    str(row["kind"] if "kind" in row.keys() else "") == "video"
+                    str(row["kind"] if "kind" in row.keys() else "")  # noqa: SIM118
+                    == "video"
                     and str(
-                        row["library_state"] if "library_state" in row.keys() else ""
+                        row["library_state"]
+                        if "library_state" in row.keys()  # noqa: SIM118
+                        else ""
                     )
                     == "in_library"
                     and permission in {"denied", "unknown"}
@@ -707,6 +716,62 @@ def persist_security_cleanup_state(path: Path = DB_PATH) -> bool:
     return clean
 
 
+def migrate_to_v10(path: Path = DB_PATH) -> None:
+    """Add ``works.lid``: cross-system unique id (``lid_`` + sha256(link)[:16]).
+
+    LID 作为 works ↔ dispatch ↔ Obsidian ↔ 飞书行的关联主键，与飞书表 LID /
+    bridge `_make_lid` / doubaosave `make_lid` 同源，用于 work_id 缺失/失败时
+    兜底定位与去重。旧库缺列则幂等 ALTER 补列并建索引。
+    """
+
+    if not path.exists() or _schema_version(path) >= 10:
+        return
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        if _table_exists(connection, "works"):
+            if "lid" not in _columns(connection, "works"):
+                connection.execute('ALTER TABLE works ADD COLUMN "lid" VARCHAR(24)')
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_works_lid ON works(lid)"
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def migrate_to_v11(path: Path = DB_PATH) -> None:
+    """Build the sqlite-vec ``chunk_vec`` index from existing embeddings.
+
+    Creates the vec0 virtual table (if sqlite-vec is installed), backfills it
+    from ``knowledge_chunks.embedding`` and removes orphaned rows.  The schema
+    bump is recorded even when the extension is unavailable so the version
+    stops advancing only when the index is actually built.
+    """
+
+    if not path.exists() or _schema_version(path) >= 11:
+        return
+    ensure_chunk_vec_sync(path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO app_settings(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (
+                SCHEMA_KEY,
+                json.dumps({"version": 11}),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def prepare_database(path: Path = DB_PATH) -> Path | None:
     backup = backup_before_upgrade(path)
     migrate_to_v4(path)
@@ -715,6 +780,8 @@ def prepare_database(path: Path = DB_PATH) -> Path | None:
     migrate_to_v7(path)
     migrate_to_v8(path)
     migrate_to_v9(path)
+    migrate_to_v10(path)
+    migrate_to_v11(path)
     persist_security_cleanup_state(path)
     return backup
 

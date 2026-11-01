@@ -69,6 +69,9 @@ class Work(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     platform: Mapped[str] = mapped_column(String(20), default="douyin", index=True)
     platform_work_id: Mapped[str] = mapped_column(String(100), index=True)
+    # LID：数据唯一标识（lid_ + sha256(原始分享链接) 前 16 位，与飞书表/桥接脚本同源），
+    # 作为跨系统关联主键（works ↔ dispatch ↔ Obsidian ↔ 飞书行），work_id 缺失/失败时兜底定位。
+    lid: Mapped[str | None] = mapped_column(String(24), index=True)
     kind: Mapped[str] = mapped_column(String(20), default="video")
     title: Mapped[str] = mapped_column(String(500), default="")
     description: Mapped[str] = mapped_column(Text, default="")

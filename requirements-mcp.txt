@@ -1,0 +1,41 @@
+# TokBrain 只读 MCP 服务（mcp_server/tokbrain_mcp.py）的独立运行环境。
+#
+# 必须装在**单独的 venv**（约定目录 .venv-mcp），不能装进主服务 .venv：
+#   - mcp 2.3.x 要求 pydantic>=2.12、uvicorn>=0.31.1、starlette>=0.48；
+#   - 主服务 requirements.txt 钉在 pydantic==2.9.2、uvicorn==0.30.6、starlette==1.3.1；
+#   - 两套 pin 在同一环境里无法同时满足，因此主 venv 装完 requirements.txt 后
+#     `pip check` 必然冲突。
+# 拆开是刻意的：MCP 进程只读数据库、独立端口，与主服务进程完全隔离。
+#
+# 安装（二选一）：
+#   1) 官方安装器：.\scripts\setup.ps1 -WithMcp
+#   2) 手工：
+#        py -3.12 -m venv .venv-mcp
+#        .venv-mcp\Scripts\python.exe -m pip install --upgrade pip==25.2
+#        .venv-mcp\Scripts\python.exe -m pip install -r requirements-mcp.txt
+#        .venv-mcp\Scripts\python.exe -m pip check
+#      启动：mcp_server\启动MCP服务.cmd
+#
+# 下列版本取自 2026-10-31 本机 .venv-mcp 实测可运行组合（MCP 服务已实际跑通）。
+
+# ── MCP 协议与 HTTP 传输 ──────────────────────────────────────
+mcp==2.3.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+
+# ── MCP 服务复用 app.* 的检索与数据层，版本与主服务解耦 ────────
+sqlalchemy==2.1.6
+aiosqlite==0.22.1
+loguru==0.7.3
+pydantic==2.14.1
+pydantic-settings==2.16.2
+sqlite-vec==0.1.9
+
+# ── app.services.knowledge 的 provider 链（只在需要用量核算时真正调用）──
+openai==3.40.0
+dashscope==2.0.2
+httpx==0.28.1
+
+# ── 杂项：时区数据与图片处理 ──────────────────────────────────
+tzdata==2026.6
+pillow==13.0.0

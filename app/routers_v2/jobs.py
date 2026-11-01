@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Job
 from app.schemas import JobView
-from app.services.jobs import cancel_job, job_to_dict
+from app.services.jobs import cancel_job, job_to_dict, retry_failed_imports
 
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -17,6 +17,12 @@ async def list_jobs(session: AsyncSession = Depends(get_db)):
         await session.execute(select(Job).order_by(desc(Job.created_at)).limit(50))
     ).scalars().all()
     return [job_to_dict(row) for row in rows]
+
+
+@router.post("/retry", response_model=dict)
+async def retry_failed_import_jobs(session: AsyncSession = Depends(get_db)):
+    """一键重试所有失败的导入：把 processing_state=failed 的作品重新排入入库队列。"""
+    return await retry_failed_imports(session)
 
 
 @router.get("/{job_id}", response_model=JobView)

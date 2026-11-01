@@ -10,7 +10,8 @@ import secrets
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 from urllib.parse import urlsplit
 
 from sqlalchemy import delete, select
@@ -35,6 +36,11 @@ INTEGRATION_TOKEN_SETTING = "external_import_token"
 MAX_EXTERNAL_METADATA_BYTES = 64 * 1024
 MAX_EXTERNAL_REQUEST_BYTES = 2 * 1024 * 1024
 _IMPORT_LOCK = asyncio.Lock()
+
+#: 有链接预检器（f2）的平台。见 app/services/f2_links.py 的 PAGE_HOST_SUFFIXES——
+#: 只有抖音域名能过 normalize_input_url，其它平台拉回来的条目没有解析器可用，
+#: 直接落 needs_local_file（元数据入库，视频补件）而不是排队等一个不存在的解析。
+RESOLVABLE_PLATFORMS = frozenset({"douyin"})
 
 
 class IntegrationImportError(RuntimeError):
@@ -234,6 +240,57 @@ async def _new_terminal_batch(
         state="succeeded",
         total_items=total_items,
         completed_at=now,
+    )
+    session.add(batch)
+    await session.flush()
+    return batch
+
+
+async def _new_pending_batch(
+    session: AsyncSession,
+    *,
+    source_type: str,
+    total_items: int,
+    queued_items: int,
+    raw_input: dict[str, object],
+) -> ImportBatch:
+    """建一个「还在排队」的批次：条目要等预检 worker 跑完才算完。
+
+    与 ``_new_terminal_batch`` 的差别只在状态语义，而这个差别很致命：
+    那个是「清单已建好，等人工补件」（succeeded + needs_local_file），
+    这个是「已入队，等后台解析」（queued + remaining）。
+
+    用错的表现是批次显示"已完成"，条目却永远挂着——预检 worker 只认
+    ``status == "queued"``，取到 pending 的条目会直接 return。
+    """
+    job = Job(
+        id=str(uuid.uuid4()),
+        job_type="link_preview",
+        state="queued",
+        progress={
+            "processed": 0,
+            "completed": 0,
+            "total": total_items,
+            "ready": 0,
+            "needs_local_file": total_items - queued_items,
+            "duplicates": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "remaining": queued_items,
+        },
+        total_items=total_items,
+        processed_items=0,
+        message=f"等待解析 {queued_items} 个链接",
+    )
+    session.add(job)
+    await session.flush()
+    batch = ImportBatch(
+        id=str(uuid.uuid4()),
+        job_id=job.id,
+        source_type=source_type,
+        raw_input=json.dumps(raw_input, ensure_ascii=False, separators=(",", ":")),
+        state="queued",
+        total_items=total_items,
     )
     session.add(batch)
     await session.flush()
@@ -623,6 +680,115 @@ def _external_item_view(item: ImportItem) -> dict[str, object]:
         "upload_url": upload_url,
         "error": error,
     }
+
+
+async def create_platform_import_batch(
+    session: AsyncSession, *, platform: str, items: list[Any], rights_attested: bool = True
+) -> dict[str, object]:
+    """Create an import batch from videos pulled via the platform connectors.
+
+    Reuses the same ``ImportBatch``/``ImportItem`` machinery as external imports so
+    pulled videos flow into the existing ingest -> parse -> library pipeline.
+    """
+    if not rights_attested:
+        raise IntegrationImportError(
+            "rights_attestation_required", "必须确认有权处理这些视频文件", status_code=422
+        )
+    rows: list[tuple[str, str, dict[str, Any]]] = []
+    for it in items:
+        d = it.to_dict() if hasattr(it, "to_dict") else dict(it)
+        pid = str(d.get("platform_work_id") or "").strip()
+        surl = d.get("source_url") or ""
+        if pid and surl:
+            rows.append((pid, surl, d))
+    if not rows:
+        raise IntegrationImportError("empty_items", "没有可导入的视频", status_code=422)
+    if not 1 <= len(rows) <= 100:
+        raise IntegrationImportError(
+            "invalid_item_count", "每批请选择 1 至 100 个视频", status_code=422
+        )
+
+    attested_at = _utcnow().isoformat(timespec="seconds") + "Z"
+    # 抖音条目交给预检 worker 由 f2 解析出媒体地址再下载；其它平台没有解析器，
+    # 直接按「元数据已就绪、视频待补件」落库，否则会挂在 pending 上等一个永不到来的解析。
+    resolvable = platform in RESOLVABLE_PLATFORMS
+    item_status = "queued" if resolvable else "needs_local_file"
+    async with _IMPORT_LOCK:
+        raw_input = {
+            "rights_attested": True,
+            "attested_at": attested_at,
+            "platform": platform,
+            "item_count": len(rows),
+        }
+        if resolvable:
+            batch = await _new_pending_batch(
+                session,
+                source_type="platform_pull",
+                total_items=len(rows),
+                queued_items=len(rows),
+                raw_input=raw_input,
+            )
+        else:
+            batch = await _new_terminal_batch(
+                session,
+                source_type="platform_pull",
+                total_items=len(rows),
+                raw_input=raw_input,
+            )
+        for ordinal, (pid, surl, d) in enumerate(rows, 1):
+            title = str(d.get("title") or f"{platform} {pid}")[:500]
+            session.add(
+                ImportItem(
+                    batch_id=batch.id,
+                    ordinal=ordinal,
+                    platform=platform,
+                    client_item_id=f"{platform}-{pid}",
+                    target_collection_id=None,
+                    input_url=surl,
+                    normalized_url=surl,
+                    platform_work_id=pid,
+                    kind=str(d.get("kind") or "video"),
+                    title=title,
+                    description=None,
+                    author_name=str(d.get("author_name") or "")[:200] or None,
+                    cover_url=d.get("cover_url"),
+                    duration_seconds=float(d.get("duration_seconds") or 0),
+                    status=item_status,
+                    raw_metadata={
+                        "platform_pull": {
+                            "published_at": d.get("published_at"),
+                            "platform_work_id": pid,
+                        }
+                    },
+                )
+            )
+        await session.commit()
+    return await batch_view(session, batch.id)
+
+
+async def enqueue_platform_batch(session: AsyncSession, batch_id: str) -> int:
+    """Enqueue a platform-pull batch's items into the link-preview coordinator.
+
+    只入队 ``queued`` 的条目：预检 worker 取到非 queued 的条目会直接 return，
+    把 needs_local_file 塞进去纯粹是白跑一趟队列。
+    """
+    from app.services.import_queue import coordinator
+
+    ids = (
+        (
+            await session.execute(
+                select(ImportItem.id).where(
+                    ImportItem.batch_id == batch_id,
+                    ImportItem.status == "queued",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if ids:
+        await coordinator.enqueue(list(ids))
+    return len(ids)
 
 
 async def external_batch_view(

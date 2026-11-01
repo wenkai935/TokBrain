@@ -337,7 +337,7 @@ async def _upload_package_file(
                         "file_too_large", "上传文件超过允许大小", status_code=413
                     )
                 digest.update(chunk)
-                output.write(chunk)
+                await asyncio.to_thread(output.write, chunk)
         actual_sha = digest.hexdigest()
         if size != row.declared_size:
             raise _error(
@@ -621,7 +621,7 @@ def _read_f2_database(path: Path) -> list[dict[str, Any]]:
             "SELECT " + ",".join(f'"{name}"' for name in allowed) + " FROM video_info"
         )
         return [
-            _record(dict(zip(allowed, row)))
+            _record(dict(zip(allowed, row, strict=True)))
             for row in connection.execute(query).fetchall()
         ]
     finally:
@@ -703,14 +703,377 @@ def _sha256_file(path: Path) -> str:
 
 
 async def _analyze(batch_id: str) -> None:
-    async with PACKAGE_LOCK:
-        async with async_session_factory() as session:
+    async with PACKAGE_LOCK, async_session_factory() as session:
+        batch = await session.get(ImportBatch, batch_id)
+        if (
+            not batch
+            or batch.source_type != "package_upload"
+            or batch.state in {"succeeded", "partial"}
+        ):
+            return
+        job = await session.get(Job, batch.job_id)
+        rows = (
+            (
+                await session.execute(
+                    select(PackageImportFile).where(
+                        PackageImportFile.batch_id == batch_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        batch.state = "running"
+        if job:
+            job.state = "running"
+            job.started_at = job.started_at or utcnow()
+            job.message = "正在识别视频与元数据"
+            scope = _scope(job)
+            scope["analysis_state"] = "running"
+            job.scope = scope
+        await session.commit()
+
+        root = DATA_DIR / "package-imports" / batch_id
+        expanded = root / "expanded"
+        expanded.mkdir(parents=True, exist_ok=True)
+        temporary_paths: list[Path] = []
+        try:
+            entries: list[tuple[str, Path]] = []
+            if rows and rows[0].role == "archive":
+                entries = await asyncio.to_thread(
+                    _zip_entries, Path(rows[0].stored_path or ""), expanded
+                )
+                temporary_paths.extend(path for _, path in entries)
+            else:
+                entries = [
+                    (row.relative_path, Path(row.stored_path or "")) for row in rows
+                ]
+            videos = [
+                (name, path)
+                for name, path in entries
+                if Path(name).suffix.lower() in VIDEO_EXTENSIONS
+            ]
+            if not videos:
+                raise _error("missing_video", "数据包中没有可用视频")
+            if len(videos) > MAX_PACKAGE_VIDEOS:
+                raise _error("too_many_videos", "每批最多检测 100 个视频")
+
+            explicit: dict[str, dict[str, Any]] = {}
+            sidecars: dict[str, list[dict[str, Any]]] = {}
+            f2_records: list[dict[str, Any]] = []
+            for name, path in entries:
+                suffix = Path(name).suffix.lower()
+                records: list[dict[str, Any]] = []
+                try:
+                    if suffix == ".json":
+                        records = await asyncio.to_thread(_read_json, path)
+                    elif suffix == ".csv":
+                        records = await asyncio.to_thread(_read_csv, path)
+                    elif suffix in {".db", ".sqlite", ".sqlite3"}:
+                        records = await asyncio.to_thread(_read_f2_database, path)
+                        f2_records.extend(records)
+                except (
+                    OSError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    sqlite3.DatabaseError,
+                    csv.Error,
+                ):
+                    continue
+                for record in records:
+                    video_file = record.get("video_file")
+                    if video_file:
+                        try:
+                            explicit[_safe_relative_path(video_file).casefold()] = (
+                                record
+                            )
+                        except IntegrationImportError:
+                            continue
+                    elif suffix in {".json", ".csv"}:
+                        sidecars.setdefault(_match_key(Path(name).stem), []).append(
+                            record
+                        )
+
+            f2_by_id = {
+                str(row.get("platform_work_id")): row
+                for row in f2_records
+                if row.get("platform_work_id")
+            }
+            f2_by_title: dict[str, list[dict[str, Any]]] = {}
+            for row in f2_records:
+                key = _match_key(row.get("description") or row.get("title"))
+                if key:
+                    f2_by_title.setdefault(key, []).append(row)
+
+            previous_items = (
+                (
+                    await session.execute(
+                        select(ImportItem).where(ImportItem.batch_id == batch_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            previous_by_ordinal = {item.ordinal: item for item in previous_items}
+            created = sum(item.status != "failed" for item in previous_items)
+            failed = sum(item.status == "failed" for item in previous_items)
+            seen_identity: set[tuple[str, str]] = {
+                (item.platform, item.platform_work_id)
+                for item in previous_items
+                if item.platform_work_id
+            }
+            target_collection_id = (
+                _scope(job).get("target_collection_id") if job else None
+            )
+            attested_at = _scope(job).get("attested_at") if job else None
+            # Prefetch existing identities in two queries instead of probing the
+            # database for every video in the loop (up to 100 videos / batch).
+            existing_by_identity: dict[tuple[str, str], int] = {
+                (row.platform, row.platform_work_id): row.id
+                for row in (
+                    await session.execute(
+                        select(
+                            Work.id, Work.platform, Work.platform_work_id
+                        ).where(Work.platform_work_id.is_not(None))
+                    )
+                ).all()
+            }
+            work_id_by_sha: dict[str, int] = {
+                row.sha256: row.work_id
+                for row in (
+                    await session.execute(
+                        select(
+                            WorkSourceAsset.sha256, WorkSourceAsset.work_id
+                        ).where(WorkSourceAsset.work_id.is_not(None))
+                    )
+                ).all()
+                if row.sha256
+            }
+            for ordinal, (relative, path) in enumerate(videos, 1):
+                if ordinal in previous_by_ordinal:
+                    continue
+                asset_dir: Path | None = None
+                destination: Path | None = None
+                try:
+                    with path.open("rb") as source:
+                        header = source.read(32)
+                    kind, extension, mime = _kind_and_extension(header)
+                    if kind != "video":
+                        raise LocalAssetError("unsupported_media", "文件不是视频")
+                    duration = await asyncio.to_thread(_verify_video, path)
+                    sha = await asyncio.to_thread(_sha256_file, path)
+                    record = explicit.get(relative.casefold()) or explicit.get(
+                        Path(relative).name.casefold()
+                    )
+                    match_source = "manifest" if record else None
+                    stem = Path(relative).stem
+                    if not record:
+                        candidates = sidecars.get(_match_key(stem), [])
+                        if len(candidates) == 1:
+                            record = candidates[0]
+                            match_source = "sidecar"
+                    numeric = DOUYIN_ID_RE.search(stem)
+                    if not record and numeric and numeric.group(1) in f2_by_id:
+                        record = f2_by_id[numeric.group(1)]
+                        match_source = "f2_database"
+                    if not record:
+                        stem_key = _match_key(stem)
+                        title_matches = [
+                            row
+                            for key, values in f2_by_title.items()
+                            if key
+                            and (
+                                key == stem_key
+                                or (len(key) >= 8 and stem_key.endswith(key))
+                            )
+                            for row in values
+                        ]
+                        if len(title_matches) == 1:
+                            record = title_matches[0]
+                            match_source = "f2_database_title"
+                    if not record and numeric:
+                        record = {
+                            "platform_work_id": numeric.group(1),
+                            "title": stem,
+                        }
+                        match_source = "filename_id"
+                    record = record or {}
+                    expected_sha = str(record.get("expected_sha256") or "").lower()
+                    if expected_sha:
+                        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+                            raise _error(
+                                "invalid_expected_sha256",
+                                f"元数据中的 SHA-256 无效：{relative}",
+                            )
+                        if expected_sha != sha:
+                            raise _error(
+                                "sha256_mismatch",
+                                f"视频与元数据声明的 SHA-256 不一致：{relative}",
+                            )
+                    platform_id = str(record.get("platform_work_id") or "")
+                    platform = "douyin" if platform_id.isdigit() else "local"
+                    if platform == "local":
+                        platform_id = f"local-{sha}"
+                        match_source = "local_fallback"
+                    identity = (platform, platform_id)
+                    existing_id = existing_by_identity.get(identity)
+                    if existing_id is None and platform == "local":
+                        # Local videos may already be attached to a work with a
+                        # different platform_work_id; fall back to the asset hash.
+                        existing_id = work_id_by_sha.get(sha)
+                    duplicate_input = identity in seen_identity
+                    seen_identity.add(identity)
+                    title = (
+                        str(
+                            record.get("title") or record.get("description") or stem
+                        ).strip()[:500]
+                        or stem[:500]
+                    )
+                    description = (
+                        str(record.get("description") or "")[:20_000] or None
+                    )
+                    source_url = str(record.get("source_url") or "")[:2000]
+                    if platform == "douyin":
+                        parsed_source = urlsplit(source_url)
+                        hostname = (parsed_source.hostname or "").lower()
+                        if parsed_source.scheme != "https" or not (
+                            hostname == "douyin.com"
+                            or hostname.endswith(".douyin.com")
+                        ):
+                            source_url = (
+                                f"https://www.douyin.com/video/{platform_id}"
+                            )
+                    extra_metadata = (
+                        dict(record.get("extra_metadata") or {})
+                        if isinstance(record.get("extra_metadata"), dict)
+                        else {}
+                    )
+                    if (
+                        len(
+                            json.dumps(
+                                extra_metadata,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        )
+                        > 64 * 1024
+                    ):
+                        raise _error(
+                            "metadata_too_large",
+                            f"单条扩展元数据超过 64 KB：{relative}",
+                        )
+                    metadata = {
+                        "external_import": {
+                            "published_at": record.get("published_at"),
+                            "extra_metadata": extra_metadata,
+                        },
+                        "import_provenance": {
+                            "source_type": "package_upload",
+                            "rights_attested": True,
+                            "attested_at": attested_at,
+                            "original_relative_path": relative,
+                            "sha256": sha,
+                            "match_source": match_source,
+                        },
+                    }
+                    if existing_id is None and not duplicate_input:
+                        # Copy before opening a write transaction. Large videos
+                        # must not hold SQLite's writer lock while shutil runs.
+                        asset_dir = (
+                            DATA_DIR
+                            / "source-assets"
+                            / f"package-{batch_id}-{ordinal}-{uuid.uuid4().hex}"
+                        )
+                        await asyncio.to_thread(
+                            asset_dir.mkdir, parents=True, exist_ok=False
+                        )
+                        destination = asset_dir / f"source{extension}"
+                        await asyncio.to_thread(shutil.copy2, path, destination)
+
+                    item = ImportItem(
+                        batch_id=batch_id,
+                        ordinal=ordinal,
+                        platform=platform,
+                        client_item_id=f"package-{ordinal}",
+                        target_collection_id=target_collection_id,
+                        input_url=(
+                            source_url
+                            if platform == "douyin"
+                            else f"package://{batch_id}/{ordinal}"
+                        ),
+                        normalized_url=(
+                            source_url
+                            if platform == "douyin"
+                            else f"package://{batch_id}/{ordinal}"
+                        ),
+                        canonical_url=source_url or None,
+                        platform_work_id=platform_id,
+                        kind="video",
+                        title=title,
+                        description=description,
+                        author_id=str(record.get("author_id") or "")[:120] or None,
+                        author_name=str(record.get("author_name") or "")[:200]
+                        or None,
+                        duration_seconds=float(duration),
+                        status=(
+                            "duplicate" if existing_id or duplicate_input else "ready"
+                        ),
+                        existing_work_id=existing_id,
+                        error_code=(
+                            "already_imported"
+                            if existing_id
+                            else ("duplicate_input" if duplicate_input else None)
+                        ),
+                        error_message=(
+                            "该视频已存在"
+                            if existing_id or duplicate_input
+                            else None
+                        ),
+                        raw_metadata=metadata,
+                    )
+                    session.add(item)
+                    await session.flush()
+                    if destination is not None:
+                        session.add(
+                            WorkSourceAsset(
+                                import_item_id=item.id,
+                                kind="video",
+                                path=str(destination),
+                                mime_type=mime,
+                                size_bytes=destination.stat().st_size,
+                                sha256=sha,
+                                position=0,
+                            )
+                        )
+                    await session.commit()
+                    if destination is None and path in temporary_paths:
+                        path.unlink(missing_ok=True)
+                    created += 1
+                except Exception as exc:
+                    await session.rollback()
+                    if asset_dir and asset_dir.exists():
+                        await asyncio.to_thread(
+                            shutil.rmtree, asset_dir, ignore_errors=True
+                        )
+                    failed += 1
+                    session.add(
+                        ImportItem(
+                            batch_id=batch_id,
+                            ordinal=ordinal,
+                            platform="local",
+                            client_item_id=f"package-{ordinal}",
+                            input_url=f"package://{batch_id}/{ordinal}",
+                            normalized_url=f"package://{batch_id}/{ordinal}",
+                            kind="video",
+                            title=Path(relative).stem[:500],
+                            status="failed",
+                            error_code=getattr(exc, "code", "invalid_video"),
+                            error_message=str(exc)[:2000],
+                        )
+                    )
+                    await session.commit()
             batch = await session.get(ImportBatch, batch_id)
-            if (
-                not batch
-                or batch.source_type != "package_upload"
-                or batch.state in {"succeeded", "partial"}
-            ):
+            if not batch:
                 return
             job = await session.get(Job, batch.job_id)
             rows = (
@@ -724,410 +1087,62 @@ async def _analyze(batch_id: str) -> None:
                 .scalars()
                 .all()
             )
-            batch.state = "running"
+            batch.total_items = len(videos)
+            batch.state = "partial" if failed else "succeeded"
+            batch.completed_at = utcnow()
+            for row in rows:
+                row.status = "analyzed"
             if job:
-                job.state = "running"
-                job.started_at = job.started_at or utcnow()
-                job.message = "正在识别视频与元数据"
+                job.state = batch.state
+                job.total_items = len(videos)
+                job.processed_items = created
+                job.failed_items = failed
+                job.completed_at = utcnow()
+                job.progress = {
+                    "files_total": len(rows),
+                    "files_uploaded": len(rows),
+                    "videos_found": len(videos),
+                    "ready": created,
+                    "failed": failed,
+                    "completed": len(videos),
+                }
+                job.message = (
+                    f"数据包检测完成：{created} 个可确认，{failed} 个失败"
+                )
                 scope = _scope(job)
-                scope["analysis_state"] = "running"
+                scope["analysis_state"] = (
+                    "completed_with_issues" if failed else "completed"
+                )
                 job.scope = scope
             await session.commit()
-
-            root = DATA_DIR / "package-imports" / batch_id
-            expanded = root / "expanded"
-            expanded.mkdir(parents=True, exist_ok=True)
-            temporary_paths: list[Path] = []
-            try:
-                entries: list[tuple[str, Path]] = []
-                if rows and rows[0].role == "archive":
-                    entries = await asyncio.to_thread(
-                        _zip_entries, Path(rows[0].stored_path or ""), expanded
-                    )
-                    temporary_paths.extend(path for _, path in entries)
-                else:
-                    entries = [
-                        (row.relative_path, Path(row.stored_path or "")) for row in rows
-                    ]
-                videos = [
-                    (name, path)
-                    for name, path in entries
-                    if Path(name).suffix.lower() in VIDEO_EXTENSIONS
-                ]
-                if not videos:
-                    raise _error("missing_video", "数据包中没有可用视频")
-                if len(videos) > MAX_PACKAGE_VIDEOS:
-                    raise _error("too_many_videos", "每批最多检测 100 个视频")
-
-                explicit: dict[str, dict[str, Any]] = {}
-                sidecars: dict[str, list[dict[str, Any]]] = {}
-                f2_records: list[dict[str, Any]] = []
-                for name, path in entries:
-                    suffix = Path(name).suffix.lower()
-                    records: list[dict[str, Any]] = []
-                    try:
-                        if suffix == ".json":
-                            records = await asyncio.to_thread(_read_json, path)
-                        elif suffix == ".csv":
-                            records = await asyncio.to_thread(_read_csv, path)
-                        elif suffix in {".db", ".sqlite", ".sqlite3"}:
-                            records = await asyncio.to_thread(_read_f2_database, path)
-                            f2_records.extend(records)
-                    except (
-                        OSError,
-                        ValueError,
-                        json.JSONDecodeError,
-                        sqlite3.DatabaseError,
-                        csv.Error,
-                    ):
-                        continue
-                    for record in records:
-                        video_file = record.get("video_file")
-                        if video_file:
-                            try:
-                                explicit[_safe_relative_path(video_file).casefold()] = (
-                                    record
-                                )
-                            except IntegrationImportError:
-                                continue
-                        elif suffix in {".json", ".csv"}:
-                            sidecars.setdefault(_match_key(Path(name).stem), []).append(
-                                record
-                            )
-
-                f2_by_id = {
-                    str(row.get("platform_work_id")): row
-                    for row in f2_records
-                    if row.get("platform_work_id")
-                }
-                f2_by_title: dict[str, list[dict[str, Any]]] = {}
-                for row in f2_records:
-                    key = _match_key(row.get("description") or row.get("title"))
-                    if key:
-                        f2_by_title.setdefault(key, []).append(row)
-
-                previous_items = (
-                    (
-                        await session.execute(
-                            select(ImportItem).where(ImportItem.batch_id == batch_id)
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                previous_by_ordinal = {item.ordinal: item for item in previous_items}
-                created = sum(item.status != "failed" for item in previous_items)
-                failed = sum(item.status == "failed" for item in previous_items)
-                seen_identity: set[tuple[str, str]] = {
-                    (item.platform, item.platform_work_id)
-                    for item in previous_items
-                    if item.platform_work_id
-                }
-                target_collection_id = (
-                    _scope(job).get("target_collection_id") if job else None
-                )
-                attested_at = _scope(job).get("attested_at") if job else None
-                for ordinal, (relative, path) in enumerate(videos, 1):
-                    if ordinal in previous_by_ordinal:
-                        continue
-                    asset_dir: Path | None = None
-                    destination: Path | None = None
-                    try:
-                        with path.open("rb") as source:
-                            header = source.read(32)
-                        kind, extension, mime = _kind_and_extension(header)
-                        if kind != "video":
-                            raise LocalAssetError("unsupported_media", "文件不是视频")
-                        duration = await asyncio.to_thread(_verify_video, path)
-                        sha = await asyncio.to_thread(_sha256_file, path)
-                        record = explicit.get(relative.casefold()) or explicit.get(
-                            Path(relative).name.casefold()
-                        )
-                        match_source = "manifest" if record else None
-                        stem = Path(relative).stem
-                        if not record:
-                            candidates = sidecars.get(_match_key(stem), [])
-                            if len(candidates) == 1:
-                                record = candidates[0]
-                                match_source = "sidecar"
-                        numeric = DOUYIN_ID_RE.search(stem)
-                        if not record and numeric and numeric.group(1) in f2_by_id:
-                            record = f2_by_id[numeric.group(1)]
-                            match_source = "f2_database"
-                        if not record:
-                            stem_key = _match_key(stem)
-                            title_matches = [
-                                row
-                                for key, values in f2_by_title.items()
-                                if key
-                                and (
-                                    key == stem_key
-                                    or (len(key) >= 8 and stem_key.endswith(key))
-                                )
-                                for row in values
-                            ]
-                            if len(title_matches) == 1:
-                                record = title_matches[0]
-                                match_source = "f2_database_title"
-                        if not record and numeric:
-                            record = {
-                                "platform_work_id": numeric.group(1),
-                                "title": stem,
-                            }
-                            match_source = "filename_id"
-                        record = record or {}
-                        expected_sha = str(record.get("expected_sha256") or "").lower()
-                        if expected_sha:
-                            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
-                                raise _error(
-                                    "invalid_expected_sha256",
-                                    f"元数据中的 SHA-256 无效：{relative}",
-                                )
-                            if expected_sha != sha:
-                                raise _error(
-                                    "sha256_mismatch",
-                                    f"视频与元数据声明的 SHA-256 不一致：{relative}",
-                                )
-                        platform_id = str(record.get("platform_work_id") or "")
-                        platform = "douyin" if platform_id.isdigit() else "local"
-                        if platform == "local":
-                            platform_id = f"local-{sha}"
-                            match_source = "local_fallback"
-                        identity = (platform, platform_id)
-                        existing = await session.scalar(
-                            select(Work).where(
-                                Work.platform == platform,
-                                Work.platform_work_id == platform_id,
-                            )
-                        )
-                        if not existing and platform == "local":
-                            old_asset = await session.scalar(
-                                select(WorkSourceAsset)
-                                .where(
-                                    WorkSourceAsset.sha256 == sha,
-                                    WorkSourceAsset.work_id.is_not(None),
-                                )
-                                .limit(1)
-                            )
-                            if old_asset:
-                                existing = await session.get(Work, old_asset.work_id)
-                        duplicate_input = identity in seen_identity
-                        seen_identity.add(identity)
-                        title = (
-                            str(
-                                record.get("title") or record.get("description") or stem
-                            ).strip()[:500]
-                            or stem[:500]
-                        )
-                        description = (
-                            str(record.get("description") or "")[:20_000] or None
-                        )
-                        source_url = str(record.get("source_url") or "")[:2000]
-                        if platform == "douyin":
-                            parsed_source = urlsplit(source_url)
-                            hostname = (parsed_source.hostname or "").lower()
-                            if parsed_source.scheme != "https" or not (
-                                hostname == "douyin.com"
-                                or hostname.endswith(".douyin.com")
-                            ):
-                                source_url = (
-                                    f"https://www.douyin.com/video/{platform_id}"
-                                )
-                        extra_metadata = (
-                            dict(record.get("extra_metadata") or {})
-                            if isinstance(record.get("extra_metadata"), dict)
-                            else {}
-                        )
-                        if (
-                            len(
-                                json.dumps(
-                                    extra_metadata,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                            )
-                            > 64 * 1024
-                        ):
-                            raise _error(
-                                "metadata_too_large",
-                                f"单条扩展元数据超过 64 KB：{relative}",
-                            )
-                        metadata = {
-                            "external_import": {
-                                "published_at": record.get("published_at"),
-                                "extra_metadata": extra_metadata,
-                            },
-                            "import_provenance": {
-                                "source_type": "package_upload",
-                                "rights_attested": True,
-                                "attested_at": attested_at,
-                                "original_relative_path": relative,
-                                "sha256": sha,
-                                "match_source": match_source,
-                            },
-                        }
-                        if not existing and not duplicate_input:
-                            # Copy before opening a write transaction. Large videos
-                            # must not hold SQLite's writer lock while shutil runs.
-                            asset_dir = (
-                                DATA_DIR
-                                / "source-assets"
-                                / f"package-{batch_id}-{ordinal}-{uuid.uuid4().hex}"
-                            )
-                            await asyncio.to_thread(
-                                asset_dir.mkdir, parents=True, exist_ok=False
-                            )
-                            destination = asset_dir / f"source{extension}"
-                            await asyncio.to_thread(shutil.copy2, path, destination)
-
-                        item = ImportItem(
-                            batch_id=batch_id,
-                            ordinal=ordinal,
-                            platform=platform,
-                            client_item_id=f"package-{ordinal}",
-                            target_collection_id=target_collection_id,
-                            input_url=(
-                                source_url
-                                if platform == "douyin"
-                                else f"package://{batch_id}/{ordinal}"
-                            ),
-                            normalized_url=(
-                                source_url
-                                if platform == "douyin"
-                                else f"package://{batch_id}/{ordinal}"
-                            ),
-                            canonical_url=source_url or None,
-                            platform_work_id=platform_id,
-                            kind="video",
-                            title=title,
-                            description=description,
-                            author_id=str(record.get("author_id") or "")[:120] or None,
-                            author_name=str(record.get("author_name") or "")[:200]
-                            or None,
-                            duration_seconds=float(duration),
-                            status=(
-                                "duplicate" if existing or duplicate_input else "ready"
-                            ),
-                            existing_work_id=existing.id if existing else None,
-                            error_code=(
-                                "already_imported"
-                                if existing
-                                else ("duplicate_input" if duplicate_input else None)
-                            ),
-                            error_message=(
-                                "该视频已存在" if existing or duplicate_input else None
-                            ),
-                            raw_metadata=metadata,
-                        )
-                        session.add(item)
-                        await session.flush()
-                        if destination is not None:
-                            session.add(
-                                WorkSourceAsset(
-                                    import_item_id=item.id,
-                                    kind="video",
-                                    path=str(destination),
-                                    mime_type=mime,
-                                    size_bytes=destination.stat().st_size,
-                                    sha256=sha,
-                                    position=0,
-                                )
-                            )
-                        await session.commit()
-                        if destination is None and path in temporary_paths:
-                            path.unlink(missing_ok=True)
-                        created += 1
-                    except Exception as exc:
-                        await session.rollback()
-                        if asset_dir and asset_dir.exists():
-                            await asyncio.to_thread(
-                                shutil.rmtree, asset_dir, ignore_errors=True
-                            )
-                        failed += 1
-                        session.add(
-                            ImportItem(
-                                batch_id=batch_id,
-                                ordinal=ordinal,
-                                platform="local",
-                                client_item_id=f"package-{ordinal}",
-                                input_url=f"package://{batch_id}/{ordinal}",
-                                normalized_url=f"package://{batch_id}/{ordinal}",
-                                kind="video",
-                                title=Path(relative).stem[:500],
-                                status="failed",
-                                error_code=getattr(exc, "code", "invalid_video"),
-                                error_message=str(exc)[:2000],
-                            )
-                        )
-                        await session.commit()
-                batch = await session.get(ImportBatch, batch_id)
-                if not batch:
-                    return
-                job = await session.get(Job, batch.job_id)
-                rows = (
-                    (
-                        await session.execute(
-                            select(PackageImportFile).where(
-                                PackageImportFile.batch_id == batch_id
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                batch.total_items = len(videos)
-                batch.state = "partial" if failed else "succeeded"
-                batch.completed_at = utcnow()
+            await refresh_manifest_progress(session, batch_id)
+            if not failed:
+                await asyncio.to_thread(shutil.rmtree, root, ignore_errors=True)
                 for row in rows:
-                    row.status = "analyzed"
-                if job:
-                    job.state = batch.state
-                    job.total_items = len(videos)
-                    job.processed_items = created
-                    job.failed_items = failed
-                    job.completed_at = utcnow()
-                    job.progress = {
-                        "files_total": len(rows),
-                        "files_uploaded": len(rows),
-                        "videos_found": len(videos),
-                        "ready": created,
-                        "failed": failed,
-                        "completed": len(videos),
-                    }
-                    job.message = (
-                        f"数据包检测完成：{created} 个可确认，{failed} 个失败"
-                    )
-                    scope = _scope(job)
-                    scope["analysis_state"] = (
-                        "completed_with_issues" if failed else "completed"
-                    )
-                    job.scope = scope
+                    row.stored_path = None
                 await session.commit()
-                await refresh_manifest_progress(session, batch_id)
-                if not failed:
-                    await asyncio.to_thread(shutil.rmtree, root, ignore_errors=True)
-                    for row in rows:
-                        row.stored_path = None
-                    await session.commit()
-            except Exception as exc:
-                await session.rollback()
-                batch = await session.get(ImportBatch, batch_id)
-                if not batch:
-                    return
-                job = await session.get(Job, batch.job_id)
-                batch.state = "failed"
-                batch.error_code = getattr(exc, "code", "package_analysis_failed")
-                batch.error_message = str(exc)[:2000]
-                batch.completed_at = utcnow()
-                if job:
-                    job.state = "failed"
-                    job.failed_items = max(1, job.failed_items)
-                    job.message = str(exc)[:2000]
-                    job.completed_at = utcnow()
-                    scope = _scope(job)
-                    scope["analysis_state"] = "failed"
-                    job.scope = scope
-                await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            batch = await session.get(ImportBatch, batch_id)
+            if not batch:
+                return
+            job = await session.get(Job, batch.job_id)
+            batch.state = "failed"
+            batch.error_code = getattr(exc, "code", "package_analysis_failed")
+            batch.error_message = str(exc)[:2000]
+            batch.completed_at = utcnow()
+            if job:
+                job.state = "failed"
+                job.failed_items = max(1, job.failed_items)
+                job.message = str(exc)[:2000]
+                job.completed_at = utcnow()
+                scope = _scope(job)
+                scope["analysis_state"] = "failed"
+                job.scope = scope
+            await session.commit()
+            # Keep the uploaded archive so the batch can be retried, but do not
+            # leave the decompressed copy behind after a failed analysis.
+            await asyncio.to_thread(shutil.rmtree, expanded, ignore_errors=True)
 
 
 async def cleanup_expired_packages() -> int:

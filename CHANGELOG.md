@@ -2,9 +2,213 @@
 
 本文件记录 TokBrain 面向用户的重要版本变化。版本日期采用上海时区。
 
-## [Unreleased]
+## [Unreleased] — 2026-11-02 · 控制台补上「停止开发模式实例」
 
-当前没有尚未发布的用户功能。
+`[4] 停止服务` 点下去没反应，不是脚本坏了，是两套进程视图没接上：`stop.ps1` 只认
+`data/runtime.json` 里记录的四个身份（pid + 创建时间 + 可执行路径 + 命令行哈希），
+而 `dev.cmd` 用 `start cmd /k` 直接拉 `uvicorn` 和 `next dev`，从不写这份状态。
+于是 `[4]` 走到「没有找到本项目的运行状态」就 `exit 0`，一个进程都没停；菜单顶部
+却按 `netstat` 显示「运行中」——一个按端口判活、一个按身份杀进程。
+
+- `scripts/menu.ps1` 新增 `dev-stop` 动作与菜单 `[11]`：独立入口，只停 `dev.cmd`
+  拉起的前后端，**不读也不写 `runtime.json`**。判定三个条件——端口来自 `netstat`
+  （事实）、进程名 + 命令行证明是本项目（`python` + `uvicorn app.main:app`；`node` +
+  含本项目 `frontend` 目录的 `next`）、`runtime.json` 未记录该 PID（记录了就拒绝并指回 `[4]`）。
+- 终止按进程树走：先向上找同类进程里最靠上的根（`next dev` 会再拉一个 `next-server`
+  子进程，只杀子进程父进程还会重起），再后进先出、先叶子后根。进程名必须一起判，
+  否则 `cmd /k "…uvicorn…"` 外壳的命令行也含关键字，会一路溯到 cmd 窗口上去。
+- 停完轮询端口 10 秒复查；没释放就明说哪个 PID 还占着，而不是报一句「已停止」了事。
+- 状态面板把 8001 / 3001 分成「受管实例」/「非受管实例」/「其他程序」三种，非受管显示黄色；
+  `[4]` 执行前先记下非受管监听者，停完指路 `[11]`。
+- `dev-stop -DryRun` 只打印将停止的进程与整棵树规模，不动手。
+
+## [Unreleased] — 2026-11-01 · 启动入口统一 + 飞书「预检后等确认」
+
+此前飞书链路有两个断层：**桥不在启动链里**（`启动.cmd` / `start.ps1` 完全不碰它，
+只有单独双击 `启动飞书同步.cmd` 才会跑），**前端轮询只查不处理**
+（`GET /api/sync/overview` 真查表但只保留行数，链接全丢弃）。所以「手机丢链接 → 本机自动处理」
+从来没成立过。
+
+**启动入口统一**
+
+- `TokBrain.cmd start` / `start-bg` / `restart` 在服务就绪后自动拉起飞书桥
+  （`start.ps1::Start-FeishuBridge`，复用 `tokbrain_control.bridge`，不写第二份逻辑）；
+  `stop` 先停桥再停服务。设 `TOKBRAIN_AUTOSTART_BRIDGE=0` 可关闭自动拉起。
+- `scripts/menu.ps1`：新增 `bridge` / `bridge-start` / `bridge-stop` 动作、状态面板加
+  「飞书同步桥」一行、菜单加 `[9]`（运行中就停，没运行就起），打开网页顺延到 `[10]`。
+- 桥由 `start.ps1` 拉起时属于同一个 Job Object，`停止.cmd` 会一并回收，不留孤儿进程。
+
+**飞书链路改成两段式（预检 → 等人放行）**
+
+- 新增 `FS_AUTO_CONFIRM`，**默认 0**：桥发现新行后只做预检（f2 补齐标题/作者/封面），
+  然后停在 `awaiting_confirm`，回写飞书「处理状态=待确认」。手机随手丢链接不该自动
+  烧解析额度、自动撞风控。设 1 回到旧的一条龙行为。
+- `dispatch` 表新增 `batch_id` 列（老库自动 backfill），`awaiting_confirm` 加入终态集合，
+  慢轨不会每轮重复导入同一行。
+- 修一个隐蔽 bug：`pending_items()` 的 SQL 把 `NOT IN (?,?,?)` 写死三个占位符，
+  终态集合从 3 个加到 4 个后直接抛 `ProgrammingError`。改成按集合长度生成。
+- 新增 `tb_sync_pending`（只读，带标题/作者）与 `tb_sync_confirm`（真的 confirm + ingest）。
+  控制面工具总数 33 → **35**（15 只读 / 20 写）。Hermes 白名单同步加上这两个。
+
+**平台采集**
+
+- `enqueued` 字段不再一律返回 `true`：B 站/小红书没有链接解析器，条目不进预检队列，
+  这个字段如实返回 `false` 并附 `queued_count`。
+
+## [Unreleased] — 2026-11-01 · 修复平台采集条目永不解析
+
+平台采集（`POST /api/platforms/{pf}/pull` 与 `dom-collect` 勾选同步）建出的批次，
+条目被写成 `status="pending"`，而链接预检 worker 的取件条件是 `status == "queued"`。
+两者不匹配的后果是：批次和任务一建好就被标成 `succeeded`，条目却永远停在
+"解析中"；`confirm` 只接受 `ready` / `needs_local_file`，于是这批视频既不会解析、
+也确认不了——整条网页采集链路是断的。
+
+- `create_platform_import_batch` 按平台分流条目状态：有解析器的平台（当前只有抖音，
+  见 `f2_links.PAGE_HOST_SUFFIXES`）写 `queued` 进预检；没有解析器的平台
+  （B 站 / 小红书）直接写 `needs_local_file`，走"元数据入库 + 视频补件"。
+- 批次状态跟着条目走：有排队条目时用新增的 `_new_pending_batch`（`queued` +
+  `job_type=link_preview`），纯补件清单仍用 `_new_terminal_batch`（`succeeded`）。
+  任务列表里这类批次现在显示「视频链接预检」而不是「本地任务」。
+- `enqueue_platform_batch` 只把 `queued` 条目放进协调器队列；此前会把
+  `needs_local_file` 一并塞进去，worker 取到后直接 return，白跑一趟。
+- `confirm_import_items` 放宽 `platform_pull`：允许无视频资产建作品（媒体缺失留到
+  ingest 阶段由 `LOCAL_SUPPLEMENT_CODES` 标补件）。`local_upload` / `external_batch`
+  仍然要求必须有上传的视频，行为不变。
+- 新增 `tests/test_platform_import_flow.py`（5 项）钉住以上约束。全量 349 passed。
+
+## [Unreleased] — 2026-11-01 · 控制面接入
+
+外部 agent（NAS 上的 Hermes）此前只能读一份手动 deploy 的只读快照，无法导入、
+无法触发解析、无法知道"现在处理到哪了"。本次补一条**实时控制通道**。
+
+- 新增 `tokbrain_control/`（纯标准库，约 2400 行）：`errors / http / upload / client /
+  service / commands / search / audit / cli`。不 import `app.*`（除 `search` 惰性加载），
+  因此 `.venv`、`.venv-mcp`、系统 Python 三个解释器都能直接跑。
+- 新增 `mcp_server/mcp_control.py`：8011 控制 MCP，**33 个 `tb_*` 工具**（14 只读 /
+  16 写），全部转发到既有 8001 REST，不复制业务逻辑。传输层沿用 streamable-http，
+  新增显式启用开关 `TOKBRAIN_CONTROL_ENABLE=1`、令牌最短 32 位、端口预检。
+- 新增 `tbctl.cmd` / `python -m tokbrain_control`：`status / doctor / service /
+  import / batch / ingest / job / work / collection / search / platform / fs / audit`，
+  `--json` 统一信封，退出码 0/1/2/3。
+- `mcp_server/_http_guard.py`：把 `BearerGuard` 抽成纯 stdlib 模块，8010 与 8011 共用；
+  `tokbrain_mcp.py` 改为别名导入，`isinstance` 断言不变。
+- 服务生命周期：只经 `scripts/stop.ps1`（保留 `runtime.json` 身份校验），启停用
+  `启动.cmd` 并注入 `TOKBRAIN_SKIP_LOCAL_UI_OPEN=1` 避免远端调用弹浏览器；
+  明确不用 `停止.cmd` / `重启.cmd`（stdin 重定向下会挂死）。
+- 新增 `mcp_server/control.env.example`、`hermes-control-config.example.yaml`、
+  `放行控制端口.cmd`（自提权，限定 /24 与 private 配置）、`挂载NAS媒体盘.cmd`、
+  `scripts/probe_control_mcp.py`。
+- **新增媒体路径约定**（`tokbrain_control/paths.py` + `tb_fs_roots` 工具）：外部 agent 在
+  NAS 上、控制面在 Windows 上，同一个文件两边路径不同。用
+  `TOKBRAIN_CONTROL_MEDIA_ROOTS=<Windows 根目录>|<NAS 前缀>` 声明对应关系后，传 NAS 路径、
+  Windows 路径或裸文件名都能正确解析；`tb_fs_roots` 返回约定表与每个目录的在线状态，
+  NAS 映射盘掉线时能直接看出来。含 `..` 的路径一律拒绝。
+- **新增飞书同步桥控制**（`tokbrain_control/bridge.py` + 5 个 `tb_sync_*` 工具）：
+  `tb_sync_status` 看进程/队列/失败原因/抖音连接，`tb_sync_start` 拉起常驻轮询（可切
+  `download=true` 真下载），`tb_sync_stop` 按命令行精确匹配停止，`tb_sync_replay` 分批重投
+  failed（支持 `newest_first`），`tb_sync_wait` 等队列跑完并返回 delta。
+  定位原则：飞书表的读取能力在 bridge 里，**不让 agent 自己读表**——会与 bridge 抢同一批行、
+  破坏「处理状态」回写。
+- 修复 `bridge_feishu_obsidian.py` 在本机代理环境下必失败的问题：`requests` 默认
+  `trust_env`，系统里配了 `HTTP_PROXY`（Clash/VPN/CI 都会配）时连 `127.0.0.1:8001` 也被推给
+  代理，后端收到 path 是 `http://127.0.0.1:8001/api/...` 直接 404。控制面拉起桥时注入
+  `NO_PROXY=127.0.0.1,localhost,::1`，`启动飞书同步.cmd` 同步加上。
+- 导入节流：`tb_import_links` 单次上限 10 条，`tb_sync_replay` 单次上限 20 条（默认 5）。
+  依据是实测数据——队列里积压的 120 条 failed 全是 429，一次性放开就会重演。
+- 新增《[TokBrain 控制面运行手册](docs/tokbrain-control-plane.md)》。
+- **并入项目统一入口**：`scripts/menu.ps1` 增加 `control` 动作与菜单 `[8]`，
+  `status` 多显示「控制面配置 control.env」与「控制端口 8011」两行；README、操作说明书
+  （新增第 11 章）、SECURITY（MCP 攻击面由两套改三套，标明 8011 可写）同步更新。
+  控制面不受 `TokBrain.cmd stop` 管辖，与主服务生命周期相互独立。
+- 新增两张架构图（`docs/diagrams/`，Archify 生成，带分场景视图与导出）：
+  `tokbrain-flow.html` 画内在功能链路（含预检闸门、单 worker、运维节点），
+  `tokbrain-boundary.html` 画进程与信任边界（三条 MCP 通道、唯一写路径、回环范围）。
+- 明确不做：`/api/chat`（检索只给证据）、克隆训练工具（产品侧未落地）、
+  把 8001/8010 暴露到局域网。
+
+## [Unreleased] — 2026-10-29 ~ 2026-10-30
+
+以下变更已在代码和运行环境中生效。**应用版本号未变，仍为 v1.0.0**，但数据库已迁移到
+schema v11；下一次正式发版时统一归入版本号。本次不推翻原有流程，主要补了三件事：把
+知识库**接到外部使用场景**（本机 MCP 与 Hermes/NAS 只读副本）、把**安全与一致性缺口**
+补上（一次独立代码审查发现的 7 项问题）、把**飞书→Obsidian 同步链路**正式纳入主流程
+并配好状态入口。
+
+### 知识检索接入外部
+
+- 新增本机只读 MCP `mcp_server/tokbrain_mcp.py`，暴露 `kb_search` / `kb_get_work` /
+  `kb_get_transcript` / `kb_list_collections` / `kb_stats` 五个工具，默认监听
+  `127.0.0.1:8010`。**绑定非回环地址时必须配置 `TOKBRAIN_MCP_TOKEN`，否则进程拒绝启动**
+  （此前默认 `0.0.0.0` 且允许空令牌，属于可被局域网直连的风险面）。
+- 新增 Hermes 专用 stdio MCP `mcp_server/tokbrain_hermes_stdio.py`，工具名 `tokbrain_*`。
+  它不监听任何网络端口，由 Hermes 按 stdio 拉起，直连只读快照。
+- 两套 MCP 都只提供读取工具，不包含新增、修改、删除能力。
+
+### Hermes / NAS 只读知识副本
+
+- 新增 `scripts/export_tokbrain_snapshot.py`（SQLite backup API 出一致快照 + integrity_check
+  + sha256 清单）、`scripts/deploy_tokbrain_snapshot.ps1`（上传临时文件 → 远端校验 → 原子替换，
+  旧库保留为 `.bak`）、`scripts/install_tokbrain_hermes_nas.py` 与两个探活脚本。
+- NAS 侧以 `mode=ro&immutable=1` 打开副本，Hermes 无法写库。首次部署验收数据：
+  **14 个已入库作品 / 305 个知识片段 / 13,217,792 字节**，SHA-256 与本地库一致。
+- 新增《[Hermes NAS 运行手册](docs/tokbrain-hermes-nas.md)》，含调用约束、快照更新、验证与回滚。
+- 明确禁止 Windows 或其他主机通过 SMB/NFS 直接打开 NAS 上的 SQLite。
+
+### 安全与一致性修复（来自一次独立代码审查）
+
+- **平台 Cookie 出站收紧**：小红书 Cookie 只发往 HTTPS 官方域名，请求前做公网 DNS 校验，
+  并逐跳校验重定向目标；不再可能把凭据带到第三方域名或明文 HTTP。
+- **MCP 鉴权**：见上，默认回环 + 非回环强制令牌，并补 `启动MCP服务.cmd` 与 `mcp.env.example`。
+- **活动模型配置贯通**：处理后端、总结、检索统一读取当前激活的模型配置档，不再各自读全局项；
+  OpenAI 兼容配置遇到百炼专属媒体能力时**明确报错拒绝**，不再静默回退。
+- **清密钥覆盖全部配置档**：一键清理会遍历 `model_profile:*:api_key`，不再漏删。
+- **预算跨日修正**：预算预留按上海时区日期绑定，避免午夜前后预留落到错误的一天。
+- **幂等重放语义**：重放历史请求返回与首次一致的 400/201 状态码，并带 `replayed=true`，
+  不再一律返回 200 掩盖首次失败。
+- 更新了一条过时的"sync 模块必须不存在"测试。
+
+### 飞书 ↔ Obsidian 同步进主流程
+
+- 新增 `app/routers_v2/sync.py`：`GET /api/sync/overview` 同步总览、`POST/GET /api/sync/feishu/relogin`
+  扫码续期；新增 `app/services/sync_status.py`（真查一次飞书表并落盘）与 `feishu_auth.py`
+  （驱动 `lark-cli` 设备码流程，产出登录二维码）。
+- 前端侧边栏新增飞书连接状态：已连接 / 授权过期 / 检测中，附最近查询时间与行数，过期时出现扫码续期入口。
+- 桥接脚本 `bridge_feishu_obsidian.py` 增至 1822 行，仍以 `--watch` 常驻、`--retry <record_id>`
+  人工重投；日常由 `启动飞书同步.cmd` 启动（独立进程，不随后端一起起）。
+- 入站接口 `POST /api/integrations/v1/inbox/items` 只负责入队（单批 ≤100 条原子校验），
+  真正处理必须由常驻桥接完成——文档已写明这个前提，避免误以为后端单独就能跑通。
+
+### 多模型配置档
+
+- 新增 `/api/model-profiles`（增删改查 + 激活），每档独立密钥；设置页可切换，
+  处理与总结按激活档执行。这替代了此前"文本、音频各填一套 Key"的写法。
+
+### 前端
+
+- 页签固定为 **导入 / 解析 / 知识库 / 设置** 四个；预检结果与"确认加入待入库"从导入页
+  移到「解析」页，模型配置也放在「解析」页。
+- 主题精简为 **4 套**：`aura`（Aura 暗壳，默认）、`sunset-cloudsea`（晚霞云海）、
+  `eastern-mist`（东方雾山）、`ocean-dawn`（海洋晨光）。
+- 本地视频改为**逐个顺序上传**，每个文件独立显示校验/上传/重复/失败状态。
+- 补充预算与网络异常的文案、批次持久化、分页返回定位、长任务轮询。
+
+### 文档
+
+- 重写 `README.md`：写清版本、schema、端口，删除不存在的网页问答承诺，新增 Hermes/NAS 章节。
+- 更正 `操作说明书.md`：本地视频为逐个顺序上传（原文"同时最多 2 个"错误）、外部数据包上限
+  （1000 候选 / 文件夹 100 视频 / ZIP 仅 1 个 / 总 20 GB）、重启语义、链接预检固定 3 worker、
+  4–8 秒冷却、日 150 次额度、403/429 熔断。
+- 新增本文 1.1.0 段；校正 `docs/表结构说明.md`、`docs/TokBrain功能层级结构图.md`、
+  `docs/本地资源储存结构.md`、`docs/pipeline-v2-plan.md`、`docs/test-cases-pipeline-v2.md`
+  等文档中与代码不符的描述（详见各文头部校订说明）。
+
+### 升级提醒
+
+- 应用版本号仍为 **v1.0.0**，数据库已迁移到 **schema v11**，API contract 仍为 **7**。
+  升级会在 `data/backups/` 自动创建迁移前备份。
+- MCP 默认端口从"监听所有地址"改为 `127.0.0.1:8010`。若你此前在别的机器上直连过 8010，
+  需要显式设置 `TOKBRAIN_MCP_HOST` 并同时配置 `TOKBRAIN_MCP_TOKEN`。
+- 需要 Hermes 侧检索时，先跑一次快照部署脚本，再重启 `hermes-household`。
 
 ## [1.0.0] - 2026-08-11
 
@@ -30,10 +234,15 @@ TokBrain 1.0 把导入、处理、整理和检索短视频知识的整个流程�
 
 ### 知识库和问答更好用
 
+> **2026-10-30 更正**：以下两条是 1.0.0 发布说明中的原始表述，与实现不符，保留原文并加注。
+> 网页端**从未提供对话/问答入口**：后端无 `/api/chat`、无 SSE 流式接口，前端的
+> `chat()` / `chat_stream()` 也没有任何调用方。实际只提供**检索**能力，且只经 MCP 对外
+> 暴露（见 [Unreleased] 段）。保留 Markdown 与公式渲染的是**总结详情页**，不是问答页。
+
 - 知识库按待处理、已入库、待补件、异常和归档分类，支持收藏夹整理、批量操作和详情返回。
-- 问答支持快速和深度模式，保留 Markdown、公式、来源与分段显示。
+- ~~问答支持快速和深度模式，保留 Markdown、公式、来源与分段显示。~~（未实现：网页端无问答入口）
 - Obsidian 导出会整理笔记和本地图片，重复导出时尽量保留用户自己写的内容。
-- 页面拆分后加载更轻，长任务轮询、分页和流式回答也更顺畅。
+- 页面拆分后加载更轻，长任务轮询、分页和流式回答也更顺畅。（"流式回答"未实现，其余已落地）
 
 ### 日常使用更稳定
 
@@ -46,7 +255,9 @@ TokBrain 1.0 把导入、处理、整理和检索短视频知识的整个流程�
 
 ### 升级提醒
 
-- 本版本为 **v1.0.0**，使用数据库 **schema v9** 和 **API contract 7**。
+- 本版本为 **v1.0.0**，发布时使用数据库 **schema v9** 和 **API contract 7**。
+  （2026-10-30 注：数据库此后已迁移至 **schema v11**，见 [Unreleased] 段与
+  [操作说明书](操作说明书.md) 第 9 节。）
 - 升级前建议备份整个 `data` 文件夹，然后双击“安装”，完成后再双击“启动”。
 - 第一次启动会先备份旧数据库，再自动整理现有数据。数据较多时请耐心等待，不要强制关机。
 - 如果更换过 Windows 用户，原来保存的模型或账单密钥可能无法读取，请在设置页重新输入。

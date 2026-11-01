@@ -18,13 +18,17 @@ from loguru import logger
 from app.config import DATA_DIR, ensure_directories, settings
 from app.database import database, init_db
 from app.routers_v2 import (
-    chat,
+    cookies,
     health,
     imports,
+    inbox,
     integrations,
     jobs,
     library,
+    model_profiles,
     package_imports,
+    platforms,
+    sync,
 )
 from app.routers_v2 import settings as settings_routes
 from app.services.import_queue import coordinator as import_coordinator
@@ -55,12 +59,16 @@ _LOCAL_HOSTS = ["127.0.0.1", "localhost", "testserver"]
 _ROUTERS = (
     imports.router,
     integrations.router,
+    inbox.router,
     package_imports.router,
     jobs.router,
     health.router,
     library.router,
-    chat.router,
     settings_routes.router,
+    platforms.router,
+    cookies.router,
+    model_profiles.router,
+    sync.router,
 )
 
 
@@ -71,7 +79,7 @@ async def _remove_abandoned_media() -> None:
 
 
 async def _stop_coordinator(name: str, coordinator: object) -> None:
-    stop = getattr(coordinator, "stop")
+    stop = coordinator.stop
     try:
         await asyncio.wait_for(stop(), timeout=45)
     except TimeoutError:
@@ -80,13 +88,125 @@ async def _stop_coordinator(name: str, coordinator: object) -> None:
         logger.exception("停止 {} 协调器时发生异常", name)
 
 
+def _ffmpeg_bin_candidates() -> list[str]:
+    """Ordered list of ffmpeg ``bin`` directories to probe, best first.
+
+    No absolute path is hard-coded to this machine: the list is built from an
+    explicit override, the checkout itself, and glob patterns over the places
+    ffmpeg builds usually land. Missing entries are simply skipped.
+    """
+    import glob
+    import os
+    from pathlib import Path
+
+    candidates: list[str] = []
+    for variable in ("FFMPEG_BIN", "TOKBRAIN_FFMPEG_BIN", "FFMPEG_HOME"):
+        value = os.environ.get(variable)
+        if not value:
+            continue
+        entry = value.strip().strip('"')
+        candidates.append(entry)
+        # FFMPEG_HOME usually points one level above bin/.
+        candidates.append(str(Path(entry) / "bin"))
+
+    project_root = Path(__file__).resolve().parent.parent
+    # FFMPEG_BIN in .env lands on the settings object, not on os.environ.
+    configured = getattr(settings, "ffmpeg_bin", None)
+    if configured:
+        candidates.append(str(configured).strip().strip('"'))
+    candidates.extend([
+        str(project_root / "tools" / "ffmpeg" / "bin"),
+        str(project_root / "ffmpeg" / "bin"),
+    ])
+
+    # Portable/unpacked builds: <anywhere>\ffmpeg*\bin, newest name first.
+    patterns = [
+        str(project_root.parent / "ffmpeg*" / "bin"),
+        r"C:\ffmpeg\bin",
+        r"C:\ffmpeg*\bin",
+        r"D:\ffmpeg*\bin",
+        r"D:\code\ffmpeg*\bin",
+        r"D:\tools\ffmpeg*\bin",
+        r"D:\tokbrain-release\ffmpeg\bin",
+        r"D:\workbuddy\frames2\ffbin",
+    ]
+    for pattern in patterns:
+        try:
+            hits = sorted(glob.glob(pattern), reverse=True)
+        except OSError:
+            continue
+        candidates.extend(hits)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = os.path.normcase(os.path.normpath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _ensure_media_runtime_on_path() -> None:
+    """Make ffmpeg/ffprobe resolvable via shutil.which regardless of how the
+    process was launched.
+
+    Some launchers (e.g. Git Bash) omit PATHEXT or mangle the Windows PATH with
+    POSIX-style ':' separators, so shutil.which(\"ffmpeg\") cannot match
+    ffmpeg.exe and the media_runtime health probe reports degraded even though
+    ffmpeg is installed. Patch the process environment once at startup:
+      - prepend the first discovered ffmpeg bin dir to PATH
+      - export FFMPEG_BIN so child processes resolve the same binary
+      - guarantee PATHEXT lists .EXE so shutil.which recognises ffmpeg.exe
+    """
+    import os
+
+    path = os.environ.get("PATH", "")
+    for cand in _ffmpeg_bin_candidates():
+        if os.path.isfile(os.path.join(cand, "ffmpeg.exe")):
+            if cand not in path:
+                path = f"{cand};{path}"
+            os.environ.setdefault("FFMPEG_BIN", cand)
+            break
+    os.environ["PATH"] = path
+
+    pathext = os.environ.get("PATHEXT", "")
+    if ".EXE" not in pathext.upper():
+        os.environ["PATHEXT"] = (f"{pathext};" if pathext else "") + ".COM;.EXE;.BAT;.CMD"
+
+
+async def _migrate_legacy_cookie_secrets() -> None:
+    """把旧版 DPAPI SecretRecord 里的 Cookie 落成统一目录下的文件。
+
+    只做一次性搬运：文件已存在就跳过。失败不阻断启动——Cookie 缺失只影响
+    需要登录态的功能，不能让整个本地服务起不来。
+    """
+
+    from app.database import async_session_factory
+    from app.services.cookie_store import migrate_legacy_secrets
+
+    try:
+        async with async_session_factory() as session:
+            migrated = await migrate_legacy_secrets(session)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("旧版 Cookie 迁移跳过：{}", exc)
+        return
+    if migrated:
+        logger.info("已把旧版 Cookie 迁入统一目录 data/cookies：{}", ", ".join(migrated))
+
+
 @asynccontextmanager
 async def _application_lifetime(_application: FastAPI) -> AsyncIterator[None]:
     started: list[tuple[str, object]] = []
     try:
+        _ensure_media_runtime_on_path()
         ensure_directories()
         await _remove_abandoned_media()
         await init_db()
+        await _migrate_legacy_cookie_secrets()
         await import_coordinator.start()
         started.append(("链接预检", import_coordinator))
         await package_import_coordinator.start()

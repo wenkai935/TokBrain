@@ -265,8 +265,7 @@ def obsidian_markdown(work: Work, row: WorkSummary, collections: list[str]) -> s
     assets = list(payload.get("asset_ids") or [])
     if assets:
         generated.extend(["", "## 相关图片", ""])
-        for asset in assets:
-            generated.append(f"![[{obsidian_asset_name(work, asset)}]]")
+        generated.extend(f"![[{obsidian_asset_name(work, asset)}]]" for asset in assets)
     generated.append(GENERATED_END)
     frontmatter = [
         "---",
