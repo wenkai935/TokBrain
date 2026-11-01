@@ -618,7 +618,7 @@ html[data-theme] .chat-form textarea:focus-visible {
   }
 }
 
-/* Theme-specific, decorative sidebar scenes. Classic night intentionally stays empty. */
+/* Theme-specific, decorative sidebar scenes for the kept local themes. */
 .theme-ambient {
   --ambient-symbol:"✦";
   position:relative;
@@ -675,76 +675,12 @@ html[data-theme] .chat-form textarea:focus-visible {
 .theme-ambient i:nth-of-type(5) { --particle-x:68%; --particle-delay:-.4s; }
 .theme-ambient i:nth-of-type(6) { --particle-x:81%; --particle-delay:-2.7s; }
 .theme-ambient i:nth-of-type(7) { --particle-x:91%; --particle-delay:-4.8s; }
-
-:root[data-theme="classic-night"] .theme-ambient { display:none; }
-:root[data-theme="dragonbone-biopunk"] .theme-ambient { --ambient-symbol:"ϟ"; }
-:root[data-theme="dragonbone-biopunk"] .ambient-symbol {
-  width:96px;
-  height:96px;
-  aspect-ratio:1;
-  box-sizing:border-box;
-  border-radius:50%;
-  transform:none;
-}
-:root[data-theme="aether-sky-city"] .theme-ambient { --ambient-symbol:"✧"; }
-:root[data-theme="aether-sky-city"] .ambient-symbol { border-style:double; border-width:3px; transform:rotate(45deg); }
-:root[data-theme="aether-sky-city"] .ambient-symbol::before { transform:rotate(-45deg); }
-:root[data-theme="abyssal-runepunk"] .theme-ambient { --ambient-symbol:"ᚱ"; }
-:root[data-theme="abyssal-runepunk"] .ambient-symbol { border-width:2px; box-shadow:inset 0 0 30px color-mix(in srgb,var(--cyan) 22%,transparent),0 0 36px color-mix(in srgb,var(--cyan) 44%,transparent); animation:ambient-rune 7s linear infinite; }
-:root[data-theme="paper-organizer"] .theme-ambient { --ambient-symbol:"▱"; opacity:.48; }
-:root[data-theme="paper-organizer"] .ambient-symbol { border-radius:4px; transform:rotate(-7deg); box-shadow:8px 8px 0 color-mix(in srgb,var(--cyan) 12%,transparent); }
 :root[data-theme="ocean-dawn"] .theme-ambient { --ambient-symbol:"≋"; }
 :root[data-theme="ocean-dawn"] .ambient-symbol { border:0; border-radius:45% 55%; background:radial-gradient(ellipse at 50% 70%,color-mix(in srgb,var(--cyan) 20%,transparent),transparent 64%); }
-:root[data-theme="aurora-snowfield"] .theme-ambient { --ambient-symbol:"⌇"; }
-:root[data-theme="aurora-snowfield"] .ambient-symbol { border:0; background:linear-gradient(135deg,transparent 18%,color-mix(in srgb,var(--cyan) 35%,transparent),color-mix(in srgb,var(--pink) 28%,transparent),transparent 78%); filter:blur(.2px); }
 :root[data-theme="eastern-mist"] .theme-ambient { --ambient-symbol:"山"; opacity:.5; }
 :root[data-theme="eastern-mist"] .ambient-symbol { border:0; border-bottom:1px solid color-mix(in srgb,var(--cyan) 36%,transparent); border-radius:0; }
-:root[data-theme="desert-observatory"] .theme-ambient { --ambient-symbol:"✷"; }
-:root[data-theme="desert-observatory"] .ambient-symbol { border-style:dashed; animation:ambient-orbit 14s linear infinite; }
 
-/* A small connected sakura tree with falling petals. */
-:root[data-theme="sakura-valley"] .theme-ambient::before {
-  left:50%;
-  top:calc(35% + 62px);
-  z-index:0;
-  width:16px;
-  height:108px;
-  translate:-50% 0;
-  border-radius:8px 8px 4px 4px;
-  background:linear-gradient(90deg,color-mix(in srgb,var(--pink) 34%,#6f5149),color-mix(in srgb,var(--pink) 12%,#9b7568));
-}
-:root[data-theme="sakura-valley"] .theme-ambient::after {
-  left:50%;
-  top:35%;
-  z-index:1;
-  width:86px;
-  height:72px;
-  translate:-50% 0;
-  border-radius:50%;
-  background:color-mix(in srgb,var(--pink) 68%,white);
-  box-shadow:
-    -38px 17px 0 -7px color-mix(in srgb,var(--pink) 72%,white),
-    38px 17px 0 -7px color-mix(in srgb,var(--pink) 64%,white);
-  filter:drop-shadow(0 7px 14px color-mix(in srgb,var(--pink) 22%,transparent));
-}
-:root[data-theme="sakura-valley"] .ambient-symbol { display:none; }
-:root[data-theme="sakura-valley"] .theme-ambient i {
-  top:calc(35% + 72px);
-  bottom:auto;
-  width:7px;
-  height:4px;
-  border-radius:70% 20% 70% 20%;
-  background:color-mix(in srgb,var(--pink) 80%,white);
-  box-shadow:none;
-  animation-name:ambient-petal-simple;
-}
-:root[data-theme="sakura-valley"] .theme-ambient i:nth-of-type(1) { left:30%; }
-:root[data-theme="sakura-valley"] .theme-ambient i:nth-of-type(2) { left:38%; }
-:root[data-theme="sakura-valley"] .theme-ambient i:nth-of-type(3) { left:46%; }
-:root[data-theme="sakura-valley"] .theme-ambient i:nth-of-type(4) { left:54%; }
-:root[data-theme="sakura-valley"] .theme-ambient i:nth-of-type(5) { left:62%; }
-:root[data-theme="sakura-valley"] .theme-ambient i:nth-of-type(6) { left:70%; }
-:root[data-theme="sakura-valley"] .theme-ambient i:nth-of-type(7) { display:none; }
+
 
 /* A single, familiar cloud glyph without extra weather decoration. */
 :root[data-theme="sunset-cloudsea"] .theme-ambient { --ambient-symbol:"☁"; }
@@ -779,41 +715,6 @@ html[data-theme] .chat-form textarea:focus-visible {
 :root[data-theme="sunset-cloudsea"] .theme-ambient i:nth-of-type(6) { left:64%; }
 :root[data-theme="sunset-cloudsea"] .theme-ambient i:nth-of-type(7) { display:none; }
 
-/* Moss, grass and a hovering dragonfly. */
-:root[data-theme="moss-forest"] .ambient-symbol { display:none; }
-:root[data-theme="moss-forest"] .theme-ambient::before {
-  right:18%;
-  bottom:16%;
-  left:18%;
-  height:96px;
-  background:
-    linear-gradient(76deg,transparent 48%,var(--cyan) 49% 51%,transparent 52%) 12% 100%/22px 72px no-repeat,
-    linear-gradient(102deg,transparent 48%,color-mix(in srgb,var(--cyan) 70%,var(--success)) 49% 51%,transparent 52%) 43% 100%/24px 94px no-repeat,
-    linear-gradient(82deg,transparent 48%,var(--success) 49% 51%,transparent 52%) 75% 100%/20px 64px no-repeat;
-  opacity:.65;
-}
-:root[data-theme="moss-forest"] .theme-ambient::after {
-  content:"⋈";
-  top:37%;
-  left:53%;
-  color:var(--cyan);
-  font:34px Georgia,serif;
-  text-shadow:0 0 12px color-mix(in srgb,var(--cyan) 70%,transparent);
-  animation:ambient-hover 3.5s ease-in-out infinite;
-}
-
-/* Volcanic forge mirrors the abyss rune scene, using 火 as its center glyph. */
-:root[data-theme="volcanic-forge"] .theme-ambient { --ambient-symbol:"火"; }
-:root[data-theme="volcanic-forge"] .ambient-symbol {
-  display:grid;
-  border-width:2px;
-  box-shadow:
-    inset 0 0 30px color-mix(in srgb,var(--cyan) 22%,transparent),
-    0 0 36px color-mix(in srgb,var(--cyan) 44%,transparent);
-  animation:ambient-rune 7s linear infinite;
-}
-:root[data-theme="volcanic-forge"] .theme-ambient::before,
-:root[data-theme="volcanic-forge"] .theme-ambient::after { display:none; }
 
 @keyframes ambient-breathe {
   0%,100% { opacity:.58; scale:.94; }
@@ -824,44 +725,10 @@ html[data-theme] .chat-form textarea:focus-visible {
   35% { opacity:.9; }
   100% { opacity:0; translate:8px -150px; }
 }
-@keyframes ambient-rune {
-  0% { rotate:0deg; filter:hue-rotate(0); }
-  50% { scale:1.05; }
-  100% { rotate:360deg; filter:hue-rotate(18deg); }
-}
-@keyframes ambient-orbit { to { rotate:360deg; } }
-@keyframes ambient-petal {
-  0% { opacity:0; translate:-8px -150px; rotate:0deg; }
-  20% { opacity:.95; }
-  100% { opacity:0; translate:18px 10px; rotate:280deg; }
-}
-@keyframes ambient-petal-simple {
-  0% { opacity:0; translate:-4px 0; rotate:0deg; }
-  18% { opacity:.9; }
-  100% { opacity:0; translate:18px 132px; rotate:240deg; }
-}
-@keyframes ambient-rain {
-  0% { opacity:0; translate:0 -90px; }
-  22% { opacity:.8; }
-  100% { opacity:0; translate:-5px 24px; }
-}
 @keyframes ambient-rain-simple {
   0% { opacity:0; translate:0 -8px; }
   18% { opacity:.92; }
   100% { opacity:0; translate:-3px 92px; }
-}
-@keyframes ambient-hover {
-  0%,100% { translate:-8px 0; rotate:-4deg; }
-  50% { translate:10px -9px; rotate:4deg; }
-}
-@keyframes ambient-lava {
-  0%,100% { scale:.88 .72; opacity:.72; }
-  50% { scale:1.08 1; opacity:1; }
-}
-@keyframes ambient-ember {
-  0% { opacity:0; translate:0 6px; }
-  24% { opacity:1; }
-  100% { opacity:0; translate:10px -128px; scale:.3; }
 }
 
 @media(max-width:760px) {

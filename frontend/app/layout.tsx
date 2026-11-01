@@ -1,20 +1,12 @@
 import type { Metadata } from "next";
 import "katex/dist/katex.min.css";
 import "./globals.css";
+import "./v3.css";
 import "../themes/styles/base.css";
-import "../themes/styles/classic-night.css";
-import "../themes/styles/dragonbone-biopunk.css";
-import "../themes/styles/aether-sky-city.css";
-import "../themes/styles/abyssal-runepunk.css";
-import "../themes/styles/paper-organizer.css";
-import "../themes/styles/ocean-dawn.css";
+import "../themes/styles/aura.css";
 import "../themes/styles/sunset-cloudsea.css";
-import "../themes/styles/aurora-snowfield.css";
 import "../themes/styles/eastern-mist.css";
-import "../themes/styles/moss-forest.css";
-import "../themes/styles/desert-observatory.css";
-import "../themes/styles/sakura-valley.css";
-import "../themes/styles/volcanic-forge.css";
+import "../themes/styles/ocean-dawn.css";
 
 import { ThemeProvider } from "../themes/ThemeProvider";
 import {

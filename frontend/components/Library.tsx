@@ -177,11 +177,52 @@ function trackReportRows(report?: Record<string, unknown> | null, kind?: string)
   return rows;
 }
 
+const PLATFORM_OPTIONS = [
+  { value: "", label: "全部平台" },
+  { value: "douyin", label: "抖音" },
+  { value: "bilibili", label: "哔哩哔哩" },
+  { value: "xiaohongshu", label: "小红书" },
+  { value: "local", label: "本地" },
+];
+const KIND_OPTIONS = [
+  { value: "", label: "全部类型" },
+  { value: "video", label: "视频" },
+  { value: "image", label: "图文" },
+  { value: "audio", label: "音频" },
+];
+const SOURCE_OPTIONS = [
+  { value: "", label: "全部来源" },
+  { value: "link", label: "链接" },
+  { value: "local_upload", label: "本地文件" },
+  { value: "platform_pull", label: "网络平台" },
+  { value: "package_upload", label: "数据包" },
+  { value: "external_batch", label: "外部导入" },
+];
+const STATE_OPTIONS: Array<{ value: LibraryState; label: string }> = [
+  { value: "pending", label: "待处理" },
+  { value: "in_library", label: "在库" },
+  { value: "supplement", label: "待补件" },
+  { value: "issues", label: "异常" },
+  { value: "archived", label: "已归档" },
+];
+
+function optionLabel(options: Array<{ value: string; label: string }>, value: string) {
+  return options.find((option) => option.value === value)?.label || value;
+}
+
 export function Library({
   state,
   setState,
   collectionId,
   setCollectionId,
+  platform,
+  setPlatform,
+  kind,
+  setKind,
+  author,
+  setAuthor,
+  source,
+  setSource,
   collections,
   summary,
   page,
@@ -197,6 +238,14 @@ export function Library({
   setState: (value: LibraryState) => void;
   collectionId: number | null;
   setCollectionId: (value: number | null) => void;
+  platform: string;
+  setPlatform: (value: string) => void;
+  kind: string;
+  setKind: (value: string) => void;
+  author: string;
+  setAuthor: (value: string) => void;
+  source: string;
+  setSource: (value: string) => void;
   collections: Collection[];
   summary: LibrarySummary;
   page: WorksPage;
@@ -220,6 +269,17 @@ export function Library({
   );
   const selectedWorks = page.items.filter((work) => selected.has(work.id));
   const canOrganize = state === "pending" || state === "in_library";
+  const authorOptions = [...new Set(
+    page.items
+      .map((work) => work.author_name)
+      .filter((name): name is string => Boolean(name)),
+  )];
+  const pills: Array<{ key: string; label: string; clear: () => void }> = [];
+  if (activeCollection) pills.push({ key: "collection", label: activeCollection.title, clear: () => setCollectionId(null) });
+  if (platform) pills.push({ key: "platform", label: optionLabel(PLATFORM_OPTIONS, platform), clear: () => setPlatform("") });
+  if (kind) pills.push({ key: "kind", label: optionLabel(KIND_OPTIONS, kind), clear: () => setKind("") });
+  if (author) pills.push({ key: "author", label: author, clear: () => setAuthor("") });
+  if (source) pills.push({ key: "source", label: optionLabel(SOURCE_OPTIONS, source), clear: () => setSource("") });
   function rememberSummaryReturn(workId: number) {
     const params = new URLSearchParams({
       tab: "library",
@@ -331,16 +391,54 @@ export function Library({
   }
   return (
     <section className="library-layout stack">
-      <div className="library-toolbar">
-        <div className="segmented" role="group" aria-label="知识库状态">
-          <button type="button" aria-pressed={state === "pending"} className={state === "pending" ? "active" : ""} onClick={() => setState("pending")}>待处理 <em>{summary.candidate_count}</em></button>
-          <button type="button" aria-pressed={state === "in_library"} className={state === "in_library" ? "active" : ""} onClick={() => setState("in_library")}>在库 <em>{summary.local_item_count}</em></button>
-          <button type="button" aria-pressed={state === "supplement"} className={state === "supplement" ? "active" : ""} onClick={() => setState("supplement")}>待补件 <em>{summary.supplement_count ?? 0}</em></button>
-          <button type="button" aria-pressed={state === "issues"} className={state === "issues" ? "active" : ""} onClick={() => setState("issues")}>异常 <em>{summary.issue_count}</em></button>
-          <button type="button" aria-pressed={state === "archived"} className={state === "archived" ? "active" : ""} onClick={() => setState("archived")}>已归档 <em>{summary.archived_count}</em></button>
-        </div>
-        <label className="collection-filter"><span>本地分组</span><select value={collectionId ?? ""} onChange={(event) => setCollectionId(event.target.value ? Number(event.target.value) : null)}><option value="">全部分组</option>{collections.map((group) => <option key={group.id} value={group.id}>{group.title}</option>)}</select></label>
+      <div className="kb-status-tabs" role="group" aria-label="知识库状态">
+        <button type="button" className={state === "pending" ? "on" : ""} onClick={() => setState("pending")}>待处理 <span className="n">{summary.candidate_count}</span></button>
+        <button type="button" className={state === "in_library" ? "on" : ""} onClick={() => setState("in_library")}>在库 <span className="n">{summary.local_item_count}</span></button>
+        <button type="button" className={state === "supplement" ? "on" : ""} onClick={() => setState("supplement")}>待补件 <span className="n">{summary.supplement_count ?? 0}</span></button>
+        <button type="button" className={state === "issues" ? "on" : ""} onClick={() => setState("issues")}>异常 <span className="n">{summary.issue_count}</span></button>
+        <button type="button" className={state === "archived" ? "on" : ""} onClick={() => setState("archived")}>已归档 <span className="n">{summary.archived_count}</span></button>
       </div>
+      <div className="kb-filterbar">
+        <label className="kb-filter"><span>分类标签</span>
+          <select value={collectionId ?? ""} onChange={(event) => setCollectionId(event.target.value ? Number(event.target.value) : null)}>
+            <option value="">全部</option>
+            {collections.map((group) => <option key={group.id} value={group.id}>{group.title}</option>)}
+          </select>
+        </label>
+        <label className="kb-filter"><span>平台</span>
+          <select value={platform} onChange={(event) => setPlatform(event.target.value)}>
+            {PLATFORM_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+        </label>
+        <label className="kb-filter"><span>类型</span>
+          <select value={kind} onChange={(event) => setKind(event.target.value)}>
+            {KIND_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+        </label>
+        <label className="kb-filter"><span>作者</span>
+          <select value={author} onChange={(event) => setAuthor(event.target.value)}>
+            <option value="">全部</option>
+            {authorOptions.map((name) => <option key={name} value={name}>{name}</option>)}
+          </select>
+        </label>
+        <label className="kb-filter"><span>导入来源</span>
+          <select value={source} onChange={(event) => setSource(event.target.value)}>
+            {SOURCE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+        </label>
+        <label className="kb-filter"><span>库状态</span>
+          <select value={state} onChange={(event) => setState(event.target.value as LibraryState)}>
+            {STATE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+        </label>
+      </div>
+      {pills.length > 0 && (
+        <div className="kb-tag-pills">
+          {pills.map((pill) => (
+            <span className="kb-pill on" key={pill.key}>{pill.label}<i className="x" role="button" title="移除该筛选" onClick={pill.clear}>×</i></span>
+          ))}
+        </div>
+      )}
       {state === "supplement" && (
         <section className="card supplement-consent">
           <div>

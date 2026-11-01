@@ -2,11 +2,6 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
-import {
-  applyChatStreamEvent,
-  createChatStreamState,
-  visibleChatStreamContent,
-} from "../lib/chatStream.ts";
 import { removeConfirmedImportItems } from "../lib/importBatches.ts";
 import {
   IMPORT_BATCH_STORAGE_KEY,
@@ -15,7 +10,6 @@ import {
   storedPackageBatches,
 } from "../lib/importBatchStorage.ts";
 import {
-  parseChatStreamEvent,
   parseImportBatch,
   parseJobs,
   parseProbe,
@@ -28,7 +22,6 @@ const pageShell = await readFile(new URL("../app/page.tsx", import.meta.url), "u
 const libraryComponent = await readFile(new URL("../components/Library.tsx", import.meta.url), "utf8");
 const settingsComponent = await readFile(new URL("../components/Settings.tsx", import.meta.url), "utf8");
 const page = [pageShell, libraryComponent, settingsComponent].join("\n");
-const chatComponent = await readFile(new URL("../components/Chat.tsx", import.meta.url), "utf8");
 const api = await readFile(new URL("../lib/api.ts", import.meta.url), "utf8");
 const contracts = await readFile(new URL("../lib/contracts.ts", import.meta.url), "utf8");
 const libraryReturn = await readFile(new URL("../lib/libraryReturn.ts", import.meta.url), "utf8");
@@ -43,25 +36,15 @@ const packageManifest = JSON.parse(
 );
 
 const expectedThemes = [
-  "classic-night",
-  "dragonbone-biopunk",
-  "aether-sky-city",
-  "abyssal-runepunk",
-  "paper-organizer",
-  "ocean-dawn",
   "sunset-cloudsea",
-  "aurora-snowfield",
   "eastern-mist",
-  "moss-forest",
-  "desert-observatory",
-  "sakura-valley",
-  "volcanic-forge",
+  "ocean-dawn",
 ];
 
 test("website branding is TokBrain and import is the primary workspace", async () => {
   const layout = await readFile(new URL("../app/layout.tsx", import.meta.url), "utf8");
   assert.match(layout, /title: "TokBrain"/);
-  assert.match(page, /type Tab = "import" \| "library" \| "chat" \| "settings"/);
+  assert.match(page, /type Tab = "import" \| "parse" \| "library" \| "settings"/);
   assert.match(page, /<strong>TokBrain<\/strong>/);
   assert.match(page, /tab === "import"/);
 });
@@ -88,11 +71,11 @@ test("frontend development and production servers bind only to localhost", () =>
   );
 });
 
-test("theme registry exposes thirteen unique locally persisted themes", () => {
+test("theme registry exposes three unique locally persisted themes", () => {
   const ids = [...themeRegistry.matchAll(/^\s+id: "([^"]+)",$/gm)].map((match) => match[1]);
   assert.deepEqual(ids, expectedThemes);
-  assert.equal(new Set(ids).size, 13);
-  assert.match(themeRegistry, /DEFAULT_THEME_ID: ThemeId = "classic-night"/);
+  assert.equal(new Set(ids).size, 3);
+  assert.match(themeRegistry, /DEFAULT_THEME_ID: ThemeId = "sunset-cloudsea"/);
   assert.match(themeProvider, /window\.localStorage\.setItem\(THEME_STORAGE_KEY, next\)/);
   assert.match(themeProvider, /document\.documentElement\.dataset\.theme = definition\.id/);
 });
@@ -257,8 +240,6 @@ test("removed collection automation and account entry points are absent", () => 
 });
 
 test("settings show fixed read-only safety values and local health", () => {
-  assert.match(page, /固定安全策略/);
-  assert.match(page, /单作品访问护栏/);
   assert.match(page, /可选解析 Cookie/);
   assert.doesNotMatch(page, /settings\.import_worker_count/);
   assert.doesNotMatch(page, /settings\.import_network_concurrency/);
@@ -266,7 +247,6 @@ test("settings show fixed read-only safety values and local health", () => {
   assert.match(page, /saveF2Cookie/);
   assert.match(page, /保存 Cookie/);
   assert.match(page, /已保存并生效/);
-  assert.match(page, /className="card principles-card"/);
   assert.match(page, /className="health-progress"/);
   assert.match(page, /api\.healthProbe/);
   assert.match(page, /敏感残留尚未清理/);
@@ -281,10 +261,7 @@ test("settings expose the editable summary prompt and default reset", () => {
   assert.match(page, /一键恢复默认提示词/);
   assert.match(page, /saveSummaryPrompt/);
   assert.match(page, /视频\/图文总结模型/);
-  assert.match(page, /快速回答模型/);
-  assert.match(page, /深度回答模型/);
   assert.match(page, /settings\.processing_model_options\.map/);
-  assert.match(page, /settings\.chat_model_options\.map/);
   assert.match(page, /qwen-math-turbo/);
   assert.match(page, /固定专用模型/);
   assert.match(page, /刷新官方账单/);
@@ -359,16 +336,16 @@ test("pending and in-library works can share local collections", () => {
   assert.match(api, /\/api\/library\/ingest\/jobs/);
 });
 
-test("sidebar ambient scenes exist for non-classic themes", () => {
+test("sidebar ambient scenes exist for every theme", () => {
   assert.match(page, /className="theme-ambient"/);
-  assert.match(themeBaseStyles, /data-theme="classic-night".*theme-ambient\s*\{\s*display:none/s);
-  for (const theme of ["sakura-valley", "abyssal-runepunk", "sunset-cloudsea", "moss-forest", "volcanic-forge"]) {
-    assert.match(themeBaseStyles, new RegExp(`data-theme="${theme}"`));
+  for (const theme of ["sunset-cloudsea", "eastern-mist", "ocean-dawn"]) {
+    assert.match(themeBaseStyles, new RegExp(`data-theme="${theme}"[^}]*--ambient-symbol`));
   }
-  assert.match(themeBaseStyles, /ambient-petal/);
   assert.match(themeBaseStyles, /sunset-cloudsea[^}]*--ambient-symbol:"☁"/s);
   assert.match(themeBaseStyles, /sunset-cloudsea[^}]*theme-ambient i[^}]*#5cb8ff/s);
-  assert.match(themeBaseStyles, /volcanic-forge[^}]*--ambient-symbol:"火"/s);
+  assert.match(themeBaseStyles, /eastern-mist[^}]*--ambient-symbol:"山"/s);
+  assert.match(themeBaseStyles, /ocean-dawn[^}]*--ambient-symbol:"≋"/s);
+  assert.doesNotMatch(themeBaseStyles, /data-theme="classic-night"/);
 });
 
 test("theme picker and background preferences remain local", () => {
@@ -379,31 +356,6 @@ test("theme picker and background preferences remain local", () => {
   assert.match(page, /aria-label="背景显现度"/);
   assert.match(themeProvider, /BACKGROUND_INTENSITY_STORAGE_KEY/);
   assert.match(themeProvider, /setBackgroundIntensity/);
-});
-
-test("chat appends user input before awaiting streamed response", () => {
-  const clearIndex = page.indexOf('setQuestion("")');
-  const appendIndex = page.indexOf("setMessages((current) => [");
-  const requestIndex = page.indexOf("await api.askStream(text, history, chatMode");
-  assert.ok(clearIndex > 0 && appendIndex > 0 && requestIndex > 0);
-  assert.ok(clearIndex < requestIndex && appendIndex < requestIndex);
-});
-
-test("chat stream keeps stages separate, accumulates deltas, and requires done", () => {
-  let state = createChatStreamState();
-  state = applyChatStreamEvent(state, { type: "stage", stage: "search", message: "正在检索" });
-  assert.equal(visibleChatStreamContent(state), "正在检索");
-  state = applyChatStreamEvent(state, { type: "sources", sources: [{ work_id: 7, title: "来源", collection: null, external_url: null }] });
-  state = applyChatStreamEvent(state, { type: "delta", text: "第一段" });
-  state = applyChatStreamEvent(state, { type: "delta", text: "第二段" });
-  state = applyChatStreamEvent(state, { type: "done", timing_ms: {} });
-  assert.equal(state.content, "第一段第二段");
-  assert.equal(state.sources[0].work_id, 7);
-  assert.equal(state.completed, true);
-  assert.throws(
-    () => applyChatStreamEvent(state, { type: "error", message: "模型失败" }),
-    /模型失败/,
-  );
 });
 
 test("library pagination de-duplicates overlapping load-more responses", () => {
@@ -474,12 +426,8 @@ test("critical API contract guards reject malformed local responses", () => {
     security_cleanup_message: "",
     summary_prompt: "总结",
     default_summary_prompt: "默认",
-    default_answer_format: "rich",
     processing_model: "processing",
-    chat_fast_model: "fast",
-    chat_deep_model: "deep",
     processing_model_options: [],
-    chat_model_options: [],
     ocr_model: "ocr",
     asr_model: "asr",
     embedding_model: "embedding",
@@ -504,7 +452,6 @@ test("critical API contract guards reject malformed local responses", () => {
     /设置格式无效/,
   );
   assert.throws(() => parseImportBatch({ id: "b1", state: "running", items: [] }), /导入批次格式无效/);
-  assert.throws(() => parseChatStreamEvent({ type: "delta", text: 1 }), /回答流事件格式无效/);
   assert.equal(parseProbe({
     probe: "coordinators",
     status: "healthy",
@@ -513,32 +460,11 @@ test("critical API contract guards reject malformed local responses", () => {
   }).details.coordinators[0].alive, true);
 });
 
-test("chat markdown is split from the import shell and stream paints are frame-batched", () => {
-  assert.match(page, /const Chat = dynamic\(/);
-  assert.match(page, /import\("\.\.\/components\/Chat"\)/);
-  assert.doesNotMatch(page, /components\/MarkdownContent/);
-  assert.match(chatComponent, /import \{ AnswerBlock \} from "\.\/MarkdownContent"/);
-  assert.match(page, /requestAnimationFrame\(renderStreamState\)/);
-});
-
 test("health checks include coordinator liveness details", () => {
   assert.match(page, /HEALTH_PROBE_NAMES = \["database", "media_runtime", "coordinators", "security_cleanup"\]/);
   assert.match(contracts, /coordinators\?: Array/);
   assert.match(page, /后台协调器/);
   assert.match(page, /workers_alive/);
-});
-
-test("chat retains markdown, math, answer formats, and fast/deep modes", async () => {
-  const markdown = await readFile(new URL("../components/MarkdownContent.tsx", import.meta.url), "utf8");
-  assert.match(chatComponent, /阅读排版/);
-  assert.match(chatComponent, /快速回答/);
-  assert.match(chatComponent, /深度回答/);
-  assert.match(markdown, /ReactMarkdown/);
-  assert.match(markdown, /remarkMath/);
-  assert.match(markdown, /rehypeKatex/);
-  assert.match(markdown, /format === "markdown" \? <pre className="markdown-source"><code>\{content\}<\/code><\/pre>/);
-  assert.match(chatComponent, /<AnswerBlock/);
-  assert.match(api, /askStream/);
 });
 
 test("import helper copy omits internal worker and cooldown details", () => {

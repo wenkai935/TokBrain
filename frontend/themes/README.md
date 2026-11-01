@@ -9,7 +9,7 @@ TokBrain 的主题是纯前端、设备本地的外观扩展。主题不会写�
 - `styles/<theme-id>.css`：必须使用 `:root[data-theme="<theme-id>"]` 限定作用域。
 - `public/themes/<theme-id>.webp`：可选的本地环境背景，不得包含文字或烘焙后的界面。
 
-当前内置 13 套主题。`classic-night` 是无图片依赖的安全回退主题。
+当前内置 4 套主题：`aura`（Aura 暗壳，**默认**）、`sunset-cloudsea`（晚霞云海）、`eastern-mist`（东方雾山）、`ocean-dawn`（海洋晨光）。以 `registry.ts` 的 `THEME_IDS` 为唯一清单，新增主题需同时提供 `styles/<theme-id>.css`。
 
 ## 新增主题
 

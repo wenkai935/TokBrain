@@ -1,20 +1,91 @@
 import type * as Contract from "./contracts";
 import {
-  parseChatStreamEvent,
   parseCollections,
   parseHealth,
   parseImportBatch,
   parseJobs,
+  parseModelProfiles,
   parseProbe,
   parseRuntimeSettings,
   parseWorksPage,
   parseWorkSummaryDetail,
 } from "./contractGuards";
 
+export interface SyncOverview {
+  feishu: {
+    connected: boolean;
+    query_ok: boolean;
+    last_query: string;
+    rows: number;
+    query_detail?: string;
+    cli_detail?: string;
+    user_name?: string;
+    expires_at?: string;
+    refresh_expires_at?: string;
+  };
+  obsidian: {
+    connected: boolean;
+    path: string;
+    detail?: string;
+  };
+  poll: {
+    frontend_refresh_sec: number;
+  };
+}
+
+/** 飞书授权一键续期的流程状态（对应 GET/POST /api/sync/feishu/relogin）。 */
+export interface FeishuRelogin {
+  state: "idle" | "starting" | "waiting" | "success" | "failed";
+  url: string;
+  user_code: string;
+  qrcode_b64: string;
+  message: string;
+  started_at: string;
+  finished_at: string;
+}
+
+/** 飞书发现批次里的一条：state=ready 可解析，unresolved 是本轮没取到信息的。 */
+export interface DiscoveryItem {
+  record_id: string;
+  batch_id: string;
+  item_id: number | null;
+  link: string;
+  lid: string;
+  state: "ready" | "unresolved";
+  title: string;
+  author_name: string;
+  platform: string;
+  kind: string;
+  cover_url: string;
+  duration_seconds: number;
+  platform_work_id: string;
+  reason: string;
+}
+
+/**
+ * 飞书发现批次。
+ *
+ * state=filling 表示 bridge 还在补齐这一轮，此时 items 必为空、计数全 0——
+ * 前端在 filling 期间不显示任何东西，避免用户看到数字跳动。
+ */
+export interface DiscoveryView {
+  state: "idle" | "filling" | "ready";
+  filling: number;
+  total: number;
+  resolvable: number;
+  unresolved: number;
+  items: DiscoveryItem[];
+  truncated: number;
+}
+
+export interface DiscoveryConfirmResult {
+  confirmed: number;
+  work_ids: number[];
+  job_id: string;
+  remaining: number;
+}
+
 export type {
-  ChatSource,
-  ChatStreamEvent,
-  ChatTurn,
   Collection,
   Health,
   ImportBatch,
@@ -29,8 +100,15 @@ export type {
   LibrarySummary,
   LocalImportBatchRequest,
   LocalVideoUploadResult,
+  ModelProfile,
+  ModelProfilePayload,
+  ModelProfilesView,
+  ModelProviderType,
   PackageImportBatchRequest,
   ObsidianManifest,
+  PlatformId,
+  PlatformStatus,
+  PlatformPullResult,
   Probe,
   RuntimeSettings,
   RuntimeSettingsUpdate,
@@ -42,13 +120,13 @@ export type {
 } from "./contracts";
 
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+  process.env.NEXT_PUBLIC_API_URL || "";
 
 const LOCAL_REQUEST_HEADER = "tokbrain-local";
 const GET_RETRY_DELAY_MS = 300;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const UPLOAD_REQUEST_TIMEOUT_MS = 30 * 60_000;
-const STREAM_INACTIVITY_TIMEOUT_MS = 60_000;
+const PULL_REQUEST_TIMEOUT_MS = 120_000;
 
 export class ApiError extends Error {
   constructor(
@@ -106,6 +184,30 @@ function requestOptions(init: RequestInit): RequestInit {
 
 async function parsedBody(response: Response): Promise<unknown> {
   return response.json().catch(() => null);
+}
+
+/** 统一 Cookie 库：一个平台的状态。只有名字/条数，永远不含 Cookie 值。 */
+export interface CookiePlatformStatus {
+  platform: string;
+  label: string;
+  filename: string;
+  path: string;
+  note: string;
+  exists: boolean;
+  cookie_count: number;
+  auth_ready: boolean;
+  missing_auth: string[];
+  names: string[];
+  expired_count: number;
+  size_bytes: number;
+  updated_at: string | null;
+}
+
+/** 一次全量上传的返回：命中哪些平台，哪些没识别到。 */
+export interface CookieVaultState {
+  directory: string;
+  platforms: CookiePlatformStatus[];
+  skipped?: string[];
 }
 
 class LocalApiClient {
@@ -192,12 +294,87 @@ class LocalApiClient {
     return this.request<unknown>("/api/system-health").then(parseHealth);
   }
 
+  /** 飞书/obsidian 连接与最近查询状态：每次调用后端都会真实查一次飞书表。 */
+  syncOverview(): Promise<SyncOverview> {
+    return this.request<unknown>("/api/sync/overview").then((body) => body as SyncOverview);
+  }
+
+  /**
+   * 飞书发现批次：bridge 补齐期间返回 state=filling（清单为空），
+   * 补齐结束才一次性给出完整清单，保证前端显示的数字不再变化。
+   */
+  discovery(): Promise<DiscoveryView> {
+    return this.request<unknown>("/api/sync/discovery").then((body) => body as DiscoveryView);
+  }
+
+  /** 用户点了「解析」：只提交选中的条目，未选中的留在待确认里。 */
+  confirmDiscovery(itemIds: number[]): Promise<DiscoveryConfirmResult> {
+    return this.request<DiscoveryConfirmResult>("/api/sync/discovery/confirm", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds }),
+    });
+  }
+
+  /**
+   * 飞书授权一键续期：后端先重测授权（多数红点是缓存或 token 已被 CLI 自动刷新），
+   * 仍失效才发起 device flow 并返回授权链接与二维码。
+   */
+  feishuReloginStart(): Promise<FeishuRelogin> {
+    return this.request<unknown>("/api/sync/feishu/relogin", { method: "POST" }).then(
+      (body) => body as FeishuRelogin,
+    );
+  }
+
+  /** 查询续期流程进度；CLI 授权成功后自动变成 success。 */
+  feishuReloginState(): Promise<FeishuRelogin> {
+    return this.request<unknown>("/api/sync/feishu/relogin").then(
+      (body) => body as FeishuRelogin,
+    );
+  }
+
   healthProbe(probe: string): Promise<Contract.Probe> {
     return this.request<unknown>(`/api/system-health/probes/${encodeURIComponent(probe)}`).then(parseProbe);
   }
 
   settings(): Promise<Contract.RuntimeSettings> {
     return this.request<unknown>("/api/settings").then(parseRuntimeSettings);
+  }
+
+  modelProfiles(): Promise<Contract.ModelProfilesView> {
+    return this.request<unknown>("/api/model-profiles").then(parseModelProfiles);
+  }
+
+  createModelProfile(
+    payload: Contract.ModelProfilePayload,
+  ): Promise<Contract.ModelProfilesView> {
+    return this.request<unknown>("/api/model-profiles", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }).then(parseModelProfiles);
+  }
+
+  updateModelProfile(
+    profileId: string,
+    payload: Contract.ModelProfilePayload,
+  ): Promise<Contract.ModelProfilesView> {
+    return this.request<unknown>(
+      `/api/model-profiles/${encodeURIComponent(profileId)}`,
+      { method: "PUT", body: JSON.stringify(payload) },
+    ).then(parseModelProfiles);
+  }
+
+  deleteModelProfile(profileId: string): Promise<Contract.ModelProfilesView> {
+    return this.request<unknown>(
+      `/api/model-profiles/${encodeURIComponent(profileId)}`,
+      { method: "DELETE" },
+    ).then(parseModelProfiles);
+  }
+
+  activateModelProfile(profileId: string): Promise<Contract.ModelProfilesView> {
+    return this.request<unknown>(
+      `/api/model-profiles/${encodeURIComponent(profileId)}/activate`,
+      { method: "POST" },
+    ).then(parseModelProfiles);
   }
 
   saveSettings(
@@ -366,6 +543,10 @@ class LocalApiClient {
     });
   }
 
+  retryFailedImports(): Promise<{ job_id: string | null; retried: number; message: string }> {
+    return this.request("/api/jobs/retry", { method: "POST" });
+  }
+
   collections(): Promise<{
     items: Contract.Collection[];
     summary: Contract.LibrarySummary;
@@ -408,18 +589,102 @@ class LocalApiClient {
 
   works(
     state: "pending" | "in_library" | "supplement" | "issues" | "archived",
-    collectionId?: number,
-    offset = 0,
+    filters: {
+      collectionId?: number;
+      platform?: string;
+      kind?: string;
+      author?: string;
+      source?: string;
+      offset?: number;
+    } = {},
   ): Promise<Contract.WorksPage> {
     const query = new URLSearchParams({
       library_state: state,
-      offset: String(offset),
+      offset: String(filters.offset ?? 0),
       limit: "60",
     });
-    if (collectionId !== undefined) {
-      query.set("collection_id", String(collectionId));
+    if (filters.collectionId !== undefined) {
+      query.set("collection_id", String(filters.collectionId));
     }
+    if (filters.platform) query.set("platform", filters.platform);
+    if (filters.kind) query.set("kind", filters.kind);
+    if (filters.author) query.set("author", filters.author);
+    if (filters.source) query.set("source", filters.source);
     return this.request<unknown>(`/api/library/works?${query}`).then(parseWorksPage);
+  }
+
+  platformStatus(platform: Contract.PlatformId): Promise<Contract.PlatformStatus> {
+    return this.request(`/api/platforms/${encodeURIComponent(platform)}/status`);
+  }
+
+  pull(
+    platform: Contract.PlatformId,
+    body: { mode: string; limit?: number; enqueue?: boolean; profile_url?: string },
+  ): Promise<Contract.PlatformPullResult> {
+    return this.request(`/api/platforms/${encodeURIComponent(platform)}/pull`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, PULL_REQUEST_TIMEOUT_MS);
+  }
+
+  domCollect(scope: string): Promise<{ task_id: string; status: string }> {
+    return this.request("/api/platforms/douyin/dom-collect", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    });
+  }
+
+  domCollectStatus(
+    taskId: string,
+  ): Promise<{ task_id: string; status: string; message: string; pulled_count: number; batch_id: string | null }> {
+    return this.request(`/api/platforms/douyin/dom-collect/${encodeURIComponent(taskId)}`);
+  }
+
+  lastPlatformBatch(): Promise<{
+    id: string;
+    state: string;
+    total_items: number;
+    created_at: string;
+    counts: Record<string, number>;
+  } | null> {
+    return this.request("/api/platforms/douyin/last-batch");
+  }
+
+  collectedVideos(scope: string): Promise<{
+    scope: string;
+    count: number;
+    groups: Array<{
+      name: string;
+      count: number;
+      items: Array<{
+        aweme_id: string;
+        title: string | null;
+        author: string | null;
+        source_url: string;
+        published_at: string | null;
+        cover_url: string | null;
+      }>;
+    }>;
+    items: Array<{
+      aweme_id: string;
+      title: string | null;
+      author: string | null;
+      source_url: string;
+      published_at: string | null;
+      cover_url: string | null;
+    }>;
+  }> {
+    return this.request(`/api/platforms/douyin/collected?scope=${encodeURIComponent(scope)}`);
+  }
+
+  syncSelected(
+    scope: string,
+    awemeIds: string[],
+  ): Promise<{ batch_id: string; count: number; enqueued: boolean; message: string }> {
+    return this.request("/api/platforms/douyin/sync-selected", {
+      method: "POST",
+      body: JSON.stringify({ scope, aweme_ids: awemeIds }),
+    });
   }
 
   uploadWorkSupplement(
@@ -472,96 +737,43 @@ class LocalApiClient {
     return this.request(`/api/library/works/${id}`, { method: "DELETE" });
   }
 
-  async askStream(
-    question: string,
-    history: Contract.ChatTurn[],
-    mode: "fast" | "deep",
-    onEvent: (event: Contract.ChatStreamEvent) => void,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const controller = new AbortController();
-    let timedOut = false;
-    let inactivityTimer = 0;
-    const forwardAbort = () => controller.abort(signal?.reason);
-    const resetInactivityTimer = () => {
-      window.clearTimeout(inactivityTimer);
-      inactivityTimer = window.setTimeout(() => {
-        timedOut = true;
-        controller.abort(new DOMException("回答流超时", "TimeoutError"));
-      }, STREAM_INACTIVITY_TIMEOUT_MS);
-    };
-    const cleanup = () => {
-      window.clearTimeout(inactivityTimer);
-      signal?.removeEventListener("abort", forwardAbort);
-    };
-    if (signal?.aborted) forwardAbort();
-    else signal?.addEventListener("abort", forwardAbort, { once: true });
-    resetInactivityTimer();
-    let response: Response;
-    try {
-      response = await fetch(this.endpoint("/api/chat/ask/stream"), {
-        method: "POST",
-        cache: "no-store",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          "X-Requested-With": LOCAL_REQUEST_HEADER,
-        },
-        body: JSON.stringify({
-          question,
-          top_k: mode === "deep" ? 8 : 6,
-          history: history.slice(-12),
-          mode,
-        }),
-      });
-    } catch (reason) {
-      cleanup();
-      if (timedOut) throw new ApiError(0, "回答流等待超时，请重试");
-      if (reason instanceof DOMException && reason.name === "AbortError") {
-        throw reason;
-      }
-      throw new ApiError(0, "无法连接本机后端，请确认服务仍在运行");
-    }
+  // --- 统一 Cookie 库 -------------------------------------------------------
 
-    if (!response.ok) {
-      const payload = await parsedBody(response);
-      cleanup();
-      throw new ApiError(
-        response.status,
-        messageFromPayload(payload, `请求失败 (${response.status})`),
-      );
-    }
-    if (!response.body) {
-      cleanup();
-      throw new ApiError(0, "浏览器无法读取流式回答");
-    }
+  cookieVault(): Promise<CookieVaultState> {
+    return this.request<CookieVaultState>("/api/cookies");
+  }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let pending = "";
-    try {
-      while (true) {
-        const chunk = await reader.read();
-        resetInactivityTimer();
-        pending += decoder.decode(chunk.value || new Uint8Array(), {
-          stream: !chunk.done,
-        });
-        const lines = pending.split("\n");
-        pending = lines.pop() || "";
-        for (const line of lines) {
-          if (line.trim()) onEvent(parseChatStreamEvent(JSON.parse(line)));
-        }
-        if (chunk.done) break;
-      }
-      if (pending.trim()) {
-        onEvent(parseChatStreamEvent(JSON.parse(pending)));
-      }
-    } catch (reason) {
-      if (timedOut) throw new ApiError(0, "回答流等待超时，请重试");
-      throw reason;
-    } finally {
-      cleanup();
-    }
+  /** 一份浏览器全量导出，后端按域名自动拆到各平台。 */
+  uploadCookieVault(file: File): Promise<CookieVaultState> {
+    const body = new FormData();
+    body.append("file", file);
+    return this.request<CookieVaultState>(
+      "/api/cookies/upload",
+      { method: "POST", body },
+      UPLOAD_REQUEST_TIMEOUT_MS,
+    );
+  }
+
+  uploadPlatformCookie(platform: string, file: File): Promise<CookiePlatformStatus> {
+    const body = new FormData();
+    body.append("file", file);
+    return this.request<CookiePlatformStatus>(
+      `/api/cookies/${encodeURIComponent(platform)}/upload`,
+      { method: "POST", body },
+      UPLOAD_REQUEST_TIMEOUT_MS,
+    );
+  }
+
+  deletePlatformCookie(platform: string): Promise<CookiePlatformStatus> {
+    return this.request<CookiePlatformStatus>(
+      `/api/cookies/${encodeURIComponent(platform)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  /** 直接给 <a download> 用：核对库里存的与喂给 yt-dlp 的是同一份。 */
+  cookieDownloadUrl(platform: string): string {
+    return this.endpoint(`/api/cookies/${encodeURIComponent(platform)}/download`);
   }
 }
 

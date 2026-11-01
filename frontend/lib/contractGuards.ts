@@ -1,10 +1,10 @@
 import type {
-  ChatStreamEvent,
   Collection,
   Health,
   ImportBatch,
   Job,
   LibrarySummary,
+  ModelProfilesView,
   RuntimeSettings,
   Probe,
   WorksPage,
@@ -59,6 +59,7 @@ export function parseRuntimeSettings(value: unknown): RuntimeSettings {
       "processing_model",
       "chat_fast_model",
       "chat_deep_model",
+      "default_answer_format",
       "ocr_model",
       "asr_model",
       "embedding_model",
@@ -69,13 +70,45 @@ export function parseRuntimeSettings(value: unknown): RuntimeSettings {
       "has_f2_cookie",
       "security_cleanup_required",
     ])
-    || !["rich", "markdown", "plain"].includes(String(value.default_answer_format))
     || !Array.isArray(value.processing_model_options)
     || !value.processing_model_options.every((item) => typeof item === "string")
     || !Array.isArray(value.chat_model_options)
     || !value.chat_model_options.every((item) => typeof item === "string")
   ) invalid("设置");
   return value as RuntimeSettings;
+}
+
+const MODEL_PROFILE_FIELDS = [
+  "id",
+  "name",
+  "ocr_model",
+  "asr_model",
+  "embedding_model",
+  "enrichment_model",
+  "chat_model",
+  "rerank_model",
+] as const;
+
+function isModelProfile(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  return MODEL_PROFILE_FIELDS.every((field) => typeof value[field] === "string")
+    && (value.provider_type === "dashscope" || value.provider_type === "openai")
+    && (value.base_url === null || typeof value.base_url === "string")
+    && typeof value.builtin === "boolean"
+    && typeof value.has_api_key === "boolean"
+    && typeof value.is_active === "boolean";
+}
+
+export function parseModelProfiles(value: unknown): ModelProfilesView {
+  if (
+    !isRecord(value)
+    || typeof value.active_id !== "string"
+    || !isRecord(value.default_profile)
+    || !isModelProfile(value.default_profile)
+    || !Array.isArray(value.items)
+    || !value.items.every(isModelProfile)
+  ) invalid("模型配置");
+  return value as ModelProfilesView;
 }
 
 export function parseProbe(value: unknown): Probe {
@@ -184,31 +217,4 @@ export function parseWorkSummaryDetail(value: unknown): WorkSummaryDetail {
     || !Array.isArray(value.assets)
   ) invalid("作品总结");
   return value as WorkSummaryDetail;
-}
-
-export function parseChatStreamEvent(value: unknown): ChatStreamEvent {
-  if (!isRecord(value) || typeof value.type !== "string") invalid("回答流事件");
-  switch (value.type) {
-    case "stage":
-      if (typeof value.stage === "string" && typeof value.message === "string") return value as ChatStreamEvent;
-      break;
-    case "sources":
-      if (
-        Array.isArray(value.sources)
-        && value.sources.every((source) =>
-          isRecord(source) && typeof source.work_id === "number" && typeof source.title === "string",
-        )
-      ) return value as ChatStreamEvent;
-      break;
-    case "delta":
-      if (typeof value.text === "string") return value as ChatStreamEvent;
-      break;
-    case "done":
-      if (isRecord(value.timing_ms)) return value as ChatStreamEvent;
-      break;
-    case "error":
-      if (typeof value.message === "string") return value as ChatStreamEvent;
-      break;
-  }
-  return invalid("回答流事件");
 }

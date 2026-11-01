@@ -34,14 +34,14 @@ export type RuntimeSettings = {
   has_f2_cookie: boolean;
   security_cleanup_required: boolean;
   security_cleanup_message: string;
-  default_answer_format: "rich" | "markdown" | "plain";
   summary_prompt: string;
   default_summary_prompt: string;
   processing_model: string;
+  processing_model_options: string[];
   chat_fast_model: string;
   chat_deep_model: string;
-  processing_model_options: string[];
   chat_model_options: string[];
+  default_answer_format: string;
   ocr_model: string;
   asr_model: string;
   embedding_model: string;
@@ -61,17 +61,55 @@ export type RuntimeSettingsUpdate = Partial<Pick<RuntimeSettings,
   | "max_scene_candidates"
   | "max_keyframes"
   | "min_keyframe_gap_seconds"
-  | "default_answer_format"
   | "summary_prompt"
   | "processing_model"
   | "chat_fast_model"
   | "chat_deep_model"
+  | "default_answer_format"
 >> & {
   dashscope_api_key?: string;
   bss_access_key_id?: string;
   bss_access_key_secret?: string;
   f2_cookie?: string;
   clear_f2_cookie?: boolean;
+};
+
+export type ModelProviderType = "dashscope" | "openai";
+
+export type ModelProfile = {
+  id: string;
+  name: string;
+  provider_type: ModelProviderType;
+  base_url: string | null;
+  builtin: boolean;
+  ocr_model: string;
+  asr_model: string;
+  embedding_model: string;
+  enrichment_model: string;
+  chat_model: string;
+  rerank_model: string;
+  has_api_key: boolean;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type ModelProfilesView = {
+  active_id: string;
+  items: ModelProfile[];
+  default_profile: ModelProfile;
+};
+
+export type ModelProfilePayload = {
+  name?: string;
+  provider_type?: ModelProviderType;
+  base_url?: string;
+  api_key?: string;
+  ocr_model?: string;
+  asr_model?: string;
+  embedding_model?: string;
+  enrichment_model?: string;
+  chat_model?: string;
+  rerank_model?: string;
 };
 
 export type Usage = {
@@ -247,6 +285,28 @@ export type IntegrationTokenStatus = {
   created_at: string | null;
 };
 
+export type PlatformId = "douyin" | "bilibili" | "xiaohongshu";
+
+export type PlatformStatus = {
+  platform: PlatformId;
+  connected: boolean;
+};
+
+export type PlatformPullResult = {
+  platform: PlatformId;
+  pulled_count: number;
+  items?: Array<{
+    platform_work_id: string;
+    source_url: string;
+    title?: string | null;
+    author_name?: string | null;
+    cover_url?: string | null;
+  }>;
+  batch_id?: string;
+  enqueued?: boolean;
+  note?: string;
+};
+
 export type IntegrationTokenCreated = IntegrationTokenStatus & {
   token: string;
 };
@@ -293,8 +353,10 @@ export type TrackReport = Record<string, unknown>;
 
 export type Work = {
   id: number;
+  platform: string;
   platform_work_id: string;
   kind: string;
+  import_source?: string | null;
   title: string;
   author_name?: string | null;
   duration_seconds: number;
@@ -337,25 +399,6 @@ export type WorksPage = {
   account_selected_count: number;
   next_offset: number | null;
 };
-
-export type ChatTurn = { role: "user" | "assistant"; content: string };
-
-export type ChatSource = {
-  work_id: number;
-  platform_work_id: string;
-  title: string;
-  collection: string | null;
-  timestamp_seconds: number | null;
-  external_url: string | null;
-  source_kind: string;
-};
-
-export type ChatStreamEvent =
-  | { type: "stage"; stage: string; message: string }
-  | { type: "sources"; sources: ChatSource[] }
-  | { type: "delta"; text: string }
-  | { type: "done"; timing_ms: Record<string, number | null> }
-  | { type: "error"; message: string };
 
 export type WorkSummaryDetail = {
   work: {

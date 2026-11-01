@@ -7,6 +7,10 @@ import { api } from "../lib/api";
 import type {
   Health,
   IntegrationTokenStatus,
+  ModelProfile,
+  ModelProfilePayload,
+  ModelProfilesView,
+  ModelProviderType,
   RuntimeSettings,
   RuntimeSettingsUpdate,
   Usage,
@@ -15,6 +19,7 @@ import { reason } from "../lib/errors";
 import type { PerformOperation } from "../lib/uiTypes";
 import { useTheme } from "../themes/ThemeProvider";
 import type { ThemeDefinition } from "../themes/registry";
+import { CookieVault } from "./CookieVault";
 
 export function ThemePicker() {
   const { theme, themes, setTheme, backgroundIntensity, setBackgroundIntensity } = useTheme();
@@ -104,6 +109,286 @@ function modelOptionLabel(model: string) {
   return notes[model] ? `${model}（${notes[model]}）` : model;
 }
 
+const PROVIDER_LABELS: Record<ModelProviderType, string> = {
+  dashscope: "阿里云百炼 DashScope",
+  openai: "OpenAI 兼容接口",
+};
+
+const MODEL_PROFILE_ROLES: Array<{ key: keyof ProfileDraft; label: string; hint: string }> = [
+  { key: "ocr_model", label: "画面识别模型", hint: "视频关键帧 OCR" },
+  { key: "asr_model", label: "语音转写模型", hint: "音频语音识别" },
+  { key: "embedding_model", label: "向量模型", hint: "知识库语义检索" },
+  { key: "enrichment_model", label: "总结模型", hint: "入库与 AI 摘要生成" },
+  { key: "chat_model", label: "对话模型", hint: "AI 问答主模型" },
+  { key: "rerank_model", label: "重排模型", hint: "检索结果精排" },
+];
+
+type ProfileDraft = {
+  name: string;
+  provider_type: ModelProviderType;
+  base_url: string;
+  api_key: string;
+  ocr_model: string;
+  asr_model: string;
+  embedding_model: string;
+  enrichment_model: string;
+  chat_model: string;
+  rerank_model: string;
+};
+
+function profileToDraft(profile: ModelProfile | null): ProfileDraft {
+  return {
+    name: profile?.name || "",
+    provider_type: profile?.provider_type || "dashscope",
+    base_url: profile?.base_url || "",
+    api_key: "",
+    ocr_model: profile?.ocr_model || "",
+    asr_model: profile?.asr_model || "",
+    embedding_model: profile?.embedding_model || "",
+    enrichment_model: profile?.enrichment_model || "",
+    chat_model: profile?.chat_model || "",
+    rerank_model: profile?.rerank_model || "",
+  };
+}
+
+function ModelProfileManager({ perform }: { perform: PerformOperation }) {
+  const [view, setView] = useState<ModelProfilesView | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [draft, setDraft] = useState<ProfileDraft | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [busyKey, setBusyKey] = useState("");
+  const [editorError, setEditorError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    api.modelProfiles()
+      .then((result) => { if (active) setView(result); })
+      .catch((value) => { if (active) setLoadError(reason(value, "读取模型配置失败")); });
+    return () => { active = false; };
+  }, []);
+
+  async function runProfileOp(
+    key: string,
+    operation: () => Promise<ModelProfilesView>,
+    success: string,
+  ) {
+    setBusyKey(key);
+    setEditorError("");
+    try {
+      const ok = await perform(key, operation, success);
+      if (ok) {
+        setDraft(null);
+        setEditingId(null);
+      }
+      return ok;
+    } finally {
+      setBusyKey("");
+    }
+  }
+
+  function openCreate() {
+    setEditorError("");
+    if (view) {
+      // Start from the deployment-default models so new dashscope profiles
+      // mirror the current behaviour until the user overrides each role.
+      setDraft(profileToDraft(view.default_profile));
+    } else {
+      setDraft(profileToDraft(null));
+    }
+    setEditingId(null);
+  }
+
+  function startEdit(profile: ModelProfile) {
+    setEditorError("");
+    setDraft(profileToDraft(profile));
+    setEditingId(profile.id);
+  }
+
+  function activateProfile(profile: ModelProfile) {
+    void runProfileOp(
+      `mp-activate-${profile.id}`,
+      () => api.activateModelProfile(profile.id).then((result) => { setView(result); return result; }),
+      `已切换生效配置：「${profile.name}」`,
+    );
+  }
+
+  function deleteProfile(profile: ModelProfile) {
+    if (!window.confirm(`删除配置「${profile.name}」？其独立保存的 API Key 也会一并清除，删除后无法恢复。`)) return;
+    void runProfileOp(
+      `mp-delete-${profile.id}`,
+      () => api.deleteModelProfile(profile.id).then((result) => { setView(result); return result; }),
+      `已删除配置「${profile.name}」`,
+    );
+  }
+
+  async function saveEditor() {
+    if (!draft) return;
+    const name = draft.name.trim();
+    if (!name) {
+      setEditorError("请填写配置名称。");
+      return;
+    }
+    const payload: ModelProfilePayload = {
+      name,
+      provider_type: draft.provider_type,
+      base_url: draft.base_url.trim(),
+      api_key: draft.api_key.trim(),
+      ocr_model: draft.ocr_model.trim(),
+      asr_model: draft.asr_model.trim(),
+      embedding_model: draft.embedding_model.trim(),
+      enrichment_model: draft.enrichment_model.trim(),
+      chat_model: draft.chat_model.trim(),
+      rerank_model: draft.rerank_model.trim(),
+    };
+    const key = editingId ? `mp-update-${editingId}` : "mp-create";
+    void runProfileOp(
+      key,
+      editingId
+        ? () => api.updateModelProfile(editingId, payload).then((result) => { setView(result); return result; })
+        : () => api.createModelProfile(payload).then((result) => { setView(result); return result; }),
+      editingId ? `已保存配置「${name}」` : `已新增配置「${name}」`,
+    );
+  }
+
+  const rows = view
+    ? [view.default_profile, ...view.items]
+    : [];
+  const activeRow = view
+    ? rows.find((profile) => profile.id === view.active_id) || view.default_profile
+    : null;
+
+  return (
+    <section className="card model-profiles-card">
+      <div className="section-head">
+        <div><span className="kicker">模型与供应商</span><h2>多模型配置</h2></div>
+        <span className={`pill ${activeRow ? "succeeded" : "cancelled"}`}>
+          {view == null ? "读取中" : `生效：${activeRow ? activeRow.name : "内置默认"}`}
+        </span>
+      </div>
+      <p className="muted">可保存多套供应商与模型组合并随时切换。媒体解析链（OCR/ASR/画面/总结）仅支持百炼型配置；密钥经 DPAPI 加密只保存在本机后台，页面不显示明文。</p>
+      {loadError && <p className="profile-error">{loadError}</p>}
+
+      {draft && (
+        <form className="profile-editor" onSubmit={(event) => { event.preventDefault(); void saveEditor(); }}>
+          <div className="profile-editor-title">
+            <strong>{editingId ? "编辑供应商配置" : "新增供应商配置"}</strong>
+            <span className={`pill ${draft.provider_type === "openai" ? "running" : "succeeded"}`}>{PROVIDER_LABELS[draft.provider_type]}</span>
+          </div>
+          <div className="form-grid">
+            <label className="field wide">
+              <span>配置名称</span>
+              <input value={draft.name} maxLength={80} autoFocus
+                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                placeholder="例如：备选 DeepSeek 通道 / 本地网关" />
+            </label>
+            <label className="field">
+              <span>供应商类型</span>
+              <select value={draft.provider_type} aria-label="供应商类型"
+                onChange={(event) => {
+                  const providerType = event.target.value as ModelProviderType;
+                  setDraft({ ...draft, provider_type: providerType, base_url: providerType === "dashscope" ? "" : draft.base_url });
+                }}>
+                <option value="dashscope">阿里云百炼 DashScope</option>
+                <option value="openai">OpenAI 兼容接口</option>
+              </select>
+              <small>{draft.provider_type === "openai" ? "纯文本/向量/对话；不提供媒体解析专属能力" : "支持画面识别、语音转写与媒体总结全链路"}</small>
+            </label>
+            <label className="field">
+              <span>API Key {editingId ? "（留空保持不变）" : ""}</span>
+              <input type="password" autoComplete="new-password" value={draft.api_key}
+                onChange={(event) => setDraft({ ...draft, api_key: event.target.value })}
+                placeholder={editingId ? "已加密保存，无需重新输入" : "请输入该供应商的 API Key"} />
+            </label>
+            {draft.provider_type === "openai" && (
+              <label className="field wide">
+                <span>接口地址 base_url</span>
+                <input value={draft.base_url} maxLength={500} placeholder="https://api.openai.com/v1"
+                  onChange={(event) => setDraft({ ...draft, base_url: event.target.value })} />
+                <small>留空时后端使用默认 OpenAI 兼容接入点。</small>
+              </label>
+            )}
+            {MODEL_PROFILE_ROLES.map((role) => (
+              <label className="field" key={role.key}>
+                <span>{role.label}</span>
+                <input value={draft[role.key]} maxLength={200} placeholder="留空使用内置默认"
+                  onChange={(event) => setDraft({ ...draft, [role.key]: event.target.value })} />
+                <small>{role.hint}</small>
+              </label>
+            ))}
+          </div>
+          <div className="button-row">
+            <button type="submit" className="primary" disabled={busyKey !== "" || !draft.name.trim()}>
+              {busyKey ? "保存中…" : "保存配置"}
+            </button>
+            <button type="button" className="secondary" disabled={busyKey !== ""}
+              onClick={() => { setDraft(null); setEditingId(null); setEditorError(""); }}>
+              取消
+            </button>
+          </div>
+          {editorError && <p className="profile-error">{editorError}</p>}
+        </form>
+      )}
+
+      {view && (
+        <>
+          <div className="profile-list">
+            {rows.map((profile) => (
+              <div className={`profile-row ${profile.is_active ? "active" : ""}`} key={profile.id}>
+                <div className="profile-main">
+                  <div className="profile-title">
+                    <strong>{profile.name}</strong>
+                    {profile.is_active && <span className="pill succeeded">生效中</span>}
+                    {profile.builtin && !profile.is_active && <span className="pill cancelled">内置默认</span>}
+                    {!profile.builtin && profile.has_api_key && <span className="pill succeeded">已存密钥</span>}
+                    {!profile.builtin && !profile.has_api_key && <span className="pill cancelled">未存密钥</span>}
+                  </div>
+                  <div className="profile-meta">
+                    {PROVIDER_LABELS[profile.provider_type] || profile.provider_type}
+                    {profile.base_url ? ` · ${profile.base_url}` : profile.provider_type === "openai" ? " · 默认接入点" : ""}
+                  </div>
+                  <div className="profile-models" aria-label="各处理角色使用的模型">
+                    <span>画面 {profile.ocr_model || "—"}</span>
+                    <span>语音 {profile.asr_model || "—"}</span>
+                    <span>向量 {profile.embedding_model || "—"}</span>
+                    <span>总结 {profile.enrichment_model || "—"}</span>
+                    <span>对话 {profile.chat_model || "—"}</span>
+                    <span>重排 {profile.rerank_model || "—"}</span>
+                  </div>
+                </div>
+                <div className="profile-actions">
+                  {!profile.is_active && (
+                    <button type="button" className="secondary" disabled={busyKey !== ""}
+                      onClick={() => activateProfile(profile)}>
+                      启用
+                    </button>
+                  )}
+                  {!profile.builtin && (
+                    <button type="button" className="link" disabled={busyKey !== ""}
+                      onClick={() => startEdit(profile)}>
+                      编辑
+                    </button>
+                  )}
+                  {!profile.builtin && (
+                    <button type="button" className="danger profile-delete" disabled={busyKey !== ""}
+                      onClick={() => deleteProfile(profile)}>
+                      删除
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="button-row profile-add">
+            <button type="button" className="secondary" disabled={busyKey !== "" || draft !== null} onClick={openCreate}>
+              + 新增一套供应商配置
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 export function Settings({
   settings,
   usage,
@@ -148,15 +433,11 @@ export function Settings({
     const body: RuntimeSettingsUpdate = {};
     numeric.forEach((name) => body[name] = Number(form.get(name)));
     (["dashscope_api_key", "bss_access_key_id", "bss_access_key_secret"] as const).forEach((name) => { const value = String(form.get(name) || "").trim(); if (value) body[name] = value; });
-    (["processing_model", "chat_fast_model", "chat_deep_model"] as const).forEach((name) => {
+    (["processing_model", "chat_fast_model", "chat_deep_model", "default_answer_format"] as const).forEach((name) => {
       body[name] = String(form.get(name) || "");
     });
     const clearF2Cookie = form.get("clear_f2_cookie") === "on";
     body.clear_f2_cookie = clearF2Cookie;
-    const answerFormat = String(form.get("default_answer_format") || "rich");
-    body.default_answer_format = ["rich", "markdown", "plain"].includes(answerFormat)
-      ? answerFormat as RuntimeSettings["default_answer_format"]
-      : "rich";
     body.summary_prompt = summaryPromptDraft.trim() || settings.default_summary_prompt;
     const saved = await perform("settings", () => api.saveSettings(body), "设置已保存");
     if (saved) {
@@ -316,27 +597,6 @@ export function Settings({
         {settings.security_cleanup_required && (
           <section className="risk-notice"><strong>敏感残留尚未清理</strong><p>{settings.security_cleanup_message}</p></section>
         )}
-        <section className="card principles-card">
-          <div className="principles-title"><span className="kicker">本地解析原则</span><h2>主动、低频、可中断</h2></div>
-          <div className="principles-inline" aria-label="本地解析原则详情">
-            <span>有权公开内容</span>
-            <span>预检不下载、不调用 AI</span>
-            <span>解析规则变化即失败</span>
-            <span>媒体缺失可补件</span>
-            <span>不绕过平台限制</span>
-          </div>
-        </section>
-        <section className="card">
-          <div className="section-head">
-            <div><span className="kicker">固定安全策略</span><h2>单作品访问护栏</h2></div>
-            <span className="pill succeeded">不可提高</span>
-          </div>
-          <div className="safety-grid">
-            <span>每批<strong>{settings.import_batch_limit}</strong></span>
-            <span>每日<strong>{settings.import_daily_limit}</strong></span>
-          </div>
-          <p className="muted">TokBrain 仅在您主动提交链接或确认入库后进行单作品解析；不会扫描账号或收藏夹，应用启动和本地检查不会访问抖音。</p>
-        </section>
         <section className="card health-card">
           <div className="section-head">
             <div><span className="kicker">本地检查</span><h2>{health?.summary || "本地运行环境"}</h2></div>
@@ -367,6 +627,7 @@ export function Settings({
             })}
           </div>
         </section>
+        <CookieVault />
         <section className="card">
           <div className="section-head"><div><span className="kicker">处理额度</span><h2>媒体、AI 与费用</h2></div></div>
           <div className="form-grid">
@@ -378,12 +639,6 @@ export function Settings({
             <Field name="max_keyframes" label="最终保留画面" value={settings.max_keyframes} min={1} max={48} />
             <Field name="min_keyframe_gap_seconds" label="画面最小间隔" value={settings.min_keyframe_gap_seconds} min={0.2} max={60} step=".1" />
             <label className="field">
-              <span>回答默认格式</span>
-              <select name="default_answer_format" defaultValue={settings.default_answer_format}>
-                <option value="rich">阅读排版</option><option value="markdown">Markdown</option><option value="plain">纯文本</option>
-              </select>
-            </label>
-            <label className="field">
               <span>视频/图文总结模型</span>
               <select name="processing_model" defaultValue={settings.processing_model}>
                 {settings.processing_model_options.map((model) => (
@@ -392,27 +647,37 @@ export function Settings({
               </select>
               <small>仅列出支持 JSON 结构化总结的文本生成模型；向量、重排、语音模型不能用于这里。</small>
             </label>
+            <div className="field model-readonly">
+              <span>固定专用模型</span>
+              <p>画面识别：{settings.ocr_model}<br />语音转写：{settings.asr_model}<br />向量检索：{settings.embedding_model}</p>
+            </div>
             <label className="field">
-              <span>快速回答模型</span>
+              <span>快速对话模型</span>
               <select name="chat_fast_model" defaultValue={settings.chat_fast_model}>
                 {settings.chat_model_options.map((model) => (
                   <option key={model} value={model}>{modelOptionLabel(model)}</option>
                 ))}
               </select>
+              <small>日常问答优先使用的轻量模型，响应更快、成本更低。</small>
             </label>
             <label className="field">
-              <span>深度回答模型</span>
+              <span>深度对话模型</span>
               <select name="chat_deep_model" defaultValue={settings.chat_deep_model}>
                 {settings.chat_model_options.map((model) => (
                   <option key={model} value={model}>{modelOptionLabel(model)}</option>
                 ))}
               </select>
-              <small>第三方或专项模型须先在百炼控制台开通；本地估算未覆盖的模型以官方账单为准。</small>
+              <small>复杂分析或长上下文问题时切换使用的高能力模型。</small>
             </label>
-            <div className="field model-readonly">
-              <span>固定专用模型</span>
-              <p>画面识别：{settings.ocr_model}<br />语音转写：{settings.asr_model}<br />向量检索：{settings.embedding_model}</p>
-            </div>
+            <label className="field">
+              <span>默认回答格式</span>
+              <select name="default_answer_format" defaultValue={settings.default_answer_format}>
+                <option value="rich">图文混排（rich）</option>
+                <option value="markdown">Markdown</option>
+                <option value="plain">纯文本</option>
+              </select>
+              <small>新建对话的默认回答排版方式，单次对话内仍可随时切换。</small>
+            </label>
             <div className="field wide summary-prompt-field">
               <span>视频 AI 总结提示词</span>
               <textarea
@@ -435,17 +700,21 @@ export function Settings({
             </div>
             <label className="field wide"><span>百炼模型密钥 {settings.has_dashscope_key && "（已保存，留空不修改）"}</span><input ref={dashscopeApiKeyRef} name="dashscope_api_key" type="password" autoComplete="new-password" /></label>
             <div className="field wide cookie-field">
-              <span>可选解析 Cookie {settings.has_f2_cookie && "（已保存并生效）"}</span>
+              <span>解析 Cookie 粘贴保存 {settings.has_f2_cookie && "（已保存并生效）"}</span>
               <textarea
                 rows={3}
                 maxLength={20000}
                 autoComplete="off"
                 value={f2CookieDraft}
                 onChange={(event) => setF2CookieDraft(event.target.value)}
-                placeholder="粘贴完整 Cookie 后，必须点击下方“保存 Cookie”才会生效"
+                placeholder="没有 cookies.txt 文件时可临时粘贴；保存后会同步写入统一 Cookie 库的 douyin.txt"
               />
               <div className="cookie-field-actions">
-                <small>{settings.has_f2_cookie ? "已保存；重新粘贴可覆盖旧 Cookie" : "尚未保存 Cookie"}</small>
+                <small>
+                  {settings.has_f2_cookie
+                    ? "已保存；重新粘贴可覆盖。下载器与 F2 读的是同一份 douyin.txt"
+                    : "尚未保存；上传 cookies.txt 是更省事的方式（见上方 Cookie 上传）"}
+                </small>
                 <button
                   type="button"
                   className="secondary"
@@ -456,7 +725,7 @@ export function Settings({
                 </button>
               </div>
             </div>
-            {settings.has_f2_cookie && <label className="field checkbox-field"><span>清除已保存的解析 Cookie</span><input name="clear_f2_cookie" type="checkbox" /></label>}
+            {settings.has_f2_cookie && <label className="field checkbox-field"><span>清除已保存的解析 Cookie（会一并删除 data/cookies/douyin.txt）</span><input name="clear_f2_cookie" type="checkbox" /></label>}
             <label className="field">
               <span>账单查询 AccessKey ID {settings.has_bss_credentials && "（后台已保存）"}</span>
               <input
@@ -546,6 +815,7 @@ export function Settings({
           <p className="muted">{settings.dpapi_warning}</p>
           <p className="muted">今日公开链接 {usage?.daily_links_used || 0}/{usage?.daily_links_limit || 150} · 今日 AI {(usage?.daily_llm_tokens_used || 0).toLocaleString()}/{(usage?.daily_llm_tokens_limit || 0).toLocaleString()}</p>
         </section>
+        <ModelProfileManager perform={perform} />
         <section className="card integration-token-card">
           <div className="section-head">
             <div>
