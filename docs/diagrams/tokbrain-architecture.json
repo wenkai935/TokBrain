@@ -341,25 +341,6 @@
       "variant": "emphasis",
       "fromSide": "left",
       "toSide": "right"
-    },
-    {
-      "id": "hermes-to-control",
-      "from": "hermes",
-      "to": "control",
-      "label": "自动化操作",
-      "variant": "security",
-      "fromSide": "bottom",
-      "toSide": "bottom",
-      "via": [
-        [
-          1140,
-          545
-        ],
-        [
-          300,
-          545
-        ]
-      ]
     }
   ],
   "cards": [

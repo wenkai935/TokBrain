@@ -18,13 +18,9 @@ TokBrain 是单机、单用户、本地优先的知识库应用。它只处理�
 ## 架构地图
 
 <p align="center">
-  <img src="docs/diagrams/tokbrain-architecture.png" alt="TokBrain 架构地图：浏览器 → Next.js 前端(:3001) → FastAPI 后端(:8001，仅回环) → 服务层(32 模块 + 3 协调器) → SQLite 与本地媒体；外部依赖为阿里百炼 API、ffmpeg、平台站点、飞书多维表格；Hermes 经只读 MCP(:8010) 做问答检索、经控制层(:8011) 做自动化操作" width="100%">
+  <img src="docs/diagrams/tokbrain-architecture.png" alt="TokBrain 架构地图：浏览器 → Next.js 前端(:3001) → FastAPI 后端(:8001，仅回环) → 服务层(32 模块 + 3 协调器) → SQLite 与本地媒体；外部依赖为阿里百炼 API、ffmpeg、平台站点、飞书多维表格；Hermes 经只读 MCP(:8010) 做问答检索" width="100%">
 </p>
 
-<p align="center">
-  <b><a href="https://wenkai935.github.io/TokBrain/diagrams/tokbrain-architecture.html">打开交互式架构图</a></b>
-  &nbsp;·&nbsp; 可搜索节点、切换「主链路 / 对外 Agent 通道 / 素材来源与 AI」三个视图、深浅主题切换、导出 PNG / SVG
-</p>
 
 ## 当前能力
 
