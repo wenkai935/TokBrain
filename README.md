@@ -5,6 +5,17 @@
   <p><img alt="Windows" src="https://img.shields.io/badge/platform-Windows-0078D4?logo=windows"> <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white"> <img alt="Local only" src="https://img.shields.io/badge/network-loopback-20B2AA"> <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-green"></a></p>
 </div>
 
+## 架构地图
+
+<p align="center">
+  <img src="docs/diagrams/tokbrain-architecture.png" alt="TokBrain 架构地图：浏览器 → Next.js 前端(:3001) → FastAPI 后端(:8001，仅回环) → 服务层(32 模块 + 3 协调器) → SQLite 与本地媒体；外部依赖为阿里百炼 API、ffmpeg、平台站点、飞书多维表格；Hermes 经只读 MCP(:8010) 做问答检索、经控制层(:8011) 做自动化操作" width="100%">
+</p>
+
+<p align="center">
+  <b><a href="https://wenkai935.github.io/TokBrain/diagrams/tokbrain-architecture.html">打开交互式架构图</a></b>
+  &nbsp;·&nbsp; 可搜索节点、切换「主链路 / 对外 Agent 通道 / 素材来源与 AI」三个视图、深浅主题切换、导出 PNG / SVG
+</p>
+
 > [!IMPORTANT]
 > **本项目基于 [TokBrain](https://github.com/fyfsxkh/TokBrain) 二次开发**，原作者与版权所有者为 TokBrain contributors，上游采用 MIT 许可。
 > 基线为上游 `v1.0.0`（commit `e022d41b`，2026-08-12，API contract 7）；上游 `LICENSE` 与 `THIRD_PARTY_NOTICES.md` 均原文保留。
