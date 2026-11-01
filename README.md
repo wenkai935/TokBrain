@@ -5,6 +5,16 @@
   <p><img alt="Windows" src="https://img.shields.io/badge/platform-Windows-0078D4?logo=windows"> <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white"> <img alt="Local only" src="https://img.shields.io/badge/network-loopback-20B2AA"> <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-green"></a></p>
 </div>
 
+> [!IMPORTANT]
+> **本项目基于 [TokBrain](https://github.com/fyfsxkh/TokBrain) 二次开发**，原作者与版权所有者为 TokBrain contributors，上游采用 MIT 许可。
+> 基线为上游 `v1.0.0`（commit `e022d41b`，2026-08-12，API contract 7）；上游 `LICENSE` 与 `THIRD_PARTY_NOTICES.md` 均原文保留。
+> 本项目为**非官方二次开发版本**，与原作者无隶属关系；「TokBrain」名称及相关权利归原作者所有。
+> 本次二次开发新增内容（多平台解析、Cookie 保险库、飞书集成、Agent 控制层与 MCP 通道、向量存储、启动器与文档体系）详见 **[FORK_NOTICE.md](./FORK_NOTICE.md)**。
+
+TokBrain 是单机、单用户、本地优先的知识库应用。它只处理用户明确提交且有权处理的内容：先预检和确认，再创建入库任务；处理结果保留原始证据、时间戳和来源，便于检索、问答和导出。
+
+当前应用版本为 **v1.0.0**，数据库迁移目标为 **schema v11**，API contract 为 **7**。默认服务只监听本机：前端 `127.0.0.1:3001`，后端 `127.0.0.1:8001`。
+
 ## 架构地图
 
 <p align="center">
@@ -15,16 +25,6 @@
   <b><a href="https://wenkai935.github.io/TokBrain/diagrams/tokbrain-architecture.html">打开交互式架构图</a></b>
   &nbsp;·&nbsp; 可搜索节点、切换「主链路 / 对外 Agent 通道 / 素材来源与 AI」三个视图、深浅主题切换、导出 PNG / SVG
 </p>
-
-> [!IMPORTANT]
-> **本项目基于 [TokBrain](https://github.com/fyfsxkh/TokBrain) 二次开发**，原作者与版权所有者为 TokBrain contributors，上游采用 MIT 许可。
-> 基线为上游 `v1.0.0`（commit `e022d41b`，2026-08-12，API contract 7）；上游 `LICENSE` 与 `THIRD_PARTY_NOTICES.md` 均原文保留。
-> 本项目为**非官方二次开发版本**，与原作者无隶属关系；「TokBrain」名称及相关权利归原作者所有。
-> 本次二次开发新增内容（多平台解析、Cookie 保险库、飞书集成、Agent 控制层与 MCP 通道、向量存储、启动器与文档体系）详见 **[FORK_NOTICE.md](./FORK_NOTICE.md)**。
-
-TokBrain 是单机、单用户、本地优先的知识库应用。它只处理用户明确提交且有权处理的内容：先预检和确认，再创建入库任务；处理结果保留原始证据、时间戳和来源，便于检索、问答和导出。
-
-当前应用版本为 **v1.0.0**，数据库迁移目标为 **schema v11**，API contract 为 **7**。默认服务只监听本机：前端 `127.0.0.1:3001`，后端 `127.0.0.1:8001`。
 
 ## 当前能力
 
