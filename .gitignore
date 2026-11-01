@@ -19,6 +19,10 @@ cookies.json
 session.json
 credentials.json
 
+# MCP / 控制面本地配置（含访问令牌，不能入库）
+mcp_server/mcp.env
+mcp_server/control.env
+
 # Python environments and caches
 .venv/
 .venv-*/
@@ -75,3 +79,11 @@ _f2_research/
 *.log
 .DS_Store
 Thumbs.db
+
+# 二次开发引入的本地状态与第三方大体积资源
+cli/node_modules/
+temp/
+.playwright-cli/
+.archify-out/
+.workbuddy/
+doubaosave Skill/source/scripts/browser_profile/
