@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>TokBrain 功能思维导图 · 补充版</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    background:#f7f8fb;color:#333;padding:40px;min-width:1600px;
+  }
+  h1{font-size:22px;margin-bottom:8px}
+  .sub{font-size:12px;color:#666;margin-bottom:22px}
+  .legend{display:flex;gap:16px;font-size:11px;color:#555;margin-bottom:28px;flex-wrap:wrap}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .box{width:14px;height:14px;border-radius:4px;border:1px solid #999}
+  .tree{display:inline-block}
+  .tree ul{list-style:none;display:flex;flex-direction:column;justify-content:center;padding-left:34px;position:relative}
+  .tree>li>ul{padding-left:50px}
+  .tree li{display:flex;align-items:center;margin:7px 0;position:relative}
+  .tree li::before{content:"";position:absolute;left:-18px;top:50%;width:18px;height:1px;background:#bfbfbf}
+  .tree>li::before{display:none}
+  .tree li::after{content:"";position:absolute;left:-18px;top:0;bottom:0;width:1px;background:#bfbfbf}
+  .tree li:first-child::after{top:50%;bottom:0}
+  .tree li:last-child::after{top:0;bottom:50%}
+  .tree li:only-child::after{display:none}
+  .node{
+    display:inline-flex;align-items:center;gap:6px;
+    border-radius:7px;padding:6px 13px;font-size:12px;white-space:nowrap;
+    background:#fff;border:1px solid #c9c9d8;box-shadow:0 1px 3px rgba(0,0,0,.04);position:relative;z-index:1;
+  }
+  .root{font-size:16px;font-weight:700;background:#4a8af8;color:#fff;border-color:#3a7ae8;padding:10px 24px}
+  .l1{font-size:13px;font-weight:700;background:#eaf1ff;border-color:#a6c1ff}
+  .l2{background:#f4f6fa;border-color:#c9c9d8}
+  .l3{background:#fff;border-color:#d0d0db;color:#555}
+  .sup{background:#f5f0ff;border-color:#bfa6e8;color:#5e4b8a;border-style:dashed}
+  .tag{font-size:9px;padding:1px 6px;border-radius:99px;font-weight:600}
+  .t-new{background:#e7f8ef;color:#2a7;color:#1a7;border:1px solid #9db}
+  .t-p0{background:#ffe8e8;color:#c44;border:1px solid #ebb}
+  .note{
+    display:inline-flex;align-items:center;gap:6px;margin-left:10px;
+    font-size:10.5px;color:#6b5b95;background:#f7f5ff;border:1px dashed #a89fd9;border-radius:6px;padding:4px 10px;max-width:360px;white-space:normal;line-height:1.4;
+  }
+  .note::before{content:"→";color:#7b6ab3;font-weight:700}
+  .note-box{
+    margin-left:10px;font-size:10.5px;color:#5e4b8a;background:#faf7ff;border:1px dashed #a89fd9;border-radius:6px;padding:6px 12px;max-width:320px;line-height:1.45;
+  }
+  .arrow-annot{
+    display:flex;align-items:center;gap:4px;margin-left:10px;font-size:10px;color:#6b5b95;
+  }
+  .arrow-annot::before{content:"⇢";font-size:16px}
+  .wrap{overflow-x:auto;padding-bottom:40px}
+</style>
+</head>
+<body>
+<h1>🧠 TokBrain 功能思维导图 · 补充版</h1>
+<div class="sub">基于你提供的原图，结合现有导入/解析/知识库/设置流程，补充缺失节点与交互细节。紫色虚线框 = 本次新增补充。</div>
+<div class="legend">
+  <span><span class="box" style="background:#4a8af8;border-color:#3a7ae8"></span>根节点</span>
+  <span><span class="box" style="background:#eaf1ff;border-color:#a6c1ff"></span>一级模块</span>
+  <span><span class="box" style="background:#fff;border-color:#d0d0db"></span>原有功能</span>
+  <span><span class="box" style="background:#f5f0ff;border-color:#bfa6e8;border-style:dashed"></span>本次补充</span>
+</div>
+
+<div class="wrap">
+<ul class="tree">
+  <li>
+    <span class="node root">tokbrain</span>
+    <ul>
+      <li>
+        <span class="node l1">📥 导入</span>
+        <ul>
+          <li>
+            <span class="node l2">本地导入</span>
+            <ul>
+              <li><span class="node l3">链接导入 <span class="tag t-p0">P0</span></span>
+                <ul>
+                  <li><span class="node l3">单条</span></li>
+                  <li><span class="node l3">多条</span></li>
+                </ul>
+              </li>
+              <li><span class="node l3">上传文件</span>
+                <ul>
+                  <li><span class="node l3">视频</span></li>
+                  <li><span class="node l3">音频</span></li>
+                  <li><span class="node l3">压缩包</span></li>
+                </ul>
+              </li>
+              <li><span class="node sup">批量队列 / 去重 / 失败重试 <span class="tag t-new">补充</span></span></li>
+              <li><span class="node sup">导入进度条 + 状态机 <span class="tag t-new">补充</span></span></li>
+            </ul>
+          </li>
+          <li>
+            <span class="node l2">网络抓取</span>
+            <ul>
+              <li><span class="node l3">单条</span>
+                <ul>
+                  <li><span class="node l3">飞书侧</span></li>
+                  <li><span class="node l3">客户端无感知</span></li>
+                </ul>
+              </li>
+              <li><span class="node l3">多条</span>
+                <ul>
+                  <li><span class="node l3">单收藏夹</span></li>
+                  <li><span class="node l3">多收藏夹</span></li>
+                  <li><span class="node l3">需要对内容可选</span></li>
+                </ul>
+              </li>
+            </ul>
+          </li>
+          <li>
+            <span class="node sup">导入后触发 <span class="tag t-new">补充</span></span>
+            <div class="arrow-annot">启动前端查询 → 开始轮询 → 进入解析流程</div>
+          </li>
+        </ul>
+      </li>
+      <li>
+        <span class="node l1">⚙️ 解析</span>
+        <ul>
+          <li>
+            <span class="node l2">本地</span>
+            <ul>
+              <li><span class="node l3">调用API</span>
+                <ul>
+                  <li><span class="node l3">v1阿里模型</span></li>
+                  <li><span class="node l3">v2自由配置模型</span></li>
+                  <li><span class="node l3">v3调用本地模型</span></li>
+                </ul>
+              </li>
+              <li><span class="node sup">解析产物 <span class="tag t-new">补充</span></span>
+                <ul>
+                  <li><span class="node sup">音频分离</span></li>
+                  <li><span class="node sup">ASR 文案</span></li>
+                  <li><span class="node sup">关键帧 / 标题</span></li>
+                  <li><span class="node sup">元数据（作者/时长/平台）</span></li>
+                  <li><span class="node sup">语义切片</span></li>
+                </ul>
+              </li>
+            </ul>
+          </li>
+          <li>
+            <span class="node l2">网络文件</span>
+            <ul>
+              <li><span class="node l3">读取数据库主键与其他参数</span></li>
+              <li><span class="node l3">新旧数据比对 LID索引</span></li>
+              <li><span class="node sup">增量更新 / 软删除 <span class="tag t-new">补充</span></span></li>
+              <li><span class="node sup">解析任务队列 + 断点续传 <span class="tag t-new">补充</span></span></li>
+            </ul>
+          </li>
+          <li>
+            <span class="node l2">音频</span>
+            <ul>
+              <li><span class="node l3">v1调用api</span></li>
+              <li><span class="node l3">v2调用本地模型</span>
+                <span class="note">需要寻找合适语音转文字模型</span>
+              </li>
+            </ul>
+          </li>
+        </ul>
+      </li>
+      <li>
+        <span class="node l1">📚 知识库</span>
+        <ul>
+          <li>
+            <span class="node l2">界面总览</span>
+            <ul>
+              <li><span class="node l3">统计指标（切片数 / 渠道分布 / 最近导入）</span></li>
+              <li><span class="node l3">搜索（标题 / 作者 / 标签 / 内容）</span></li>
+              <li><span class="node l3">视图切换（列表 / 卡片）</span></li>
+              <li><span class="node sup">快捷入口（同步 / 解析 / 今日计划） <span class="tag t-new">补充</span></span></li>
+            </ul>
+          </li>
+          <li>
+            <span class="node l2">渠道分类</span>
+            <ul>
+              <li><span class="node l3">抖音</span>
+                <ul>
+                  <li><span class="node l3">子级收藏夹</span>
+                    <span class="note">生成的只是拆解，需要转换为 agent 可读的格式</span>
+                  </li>
+                </ul>
+              </li>
+              <li><span class="node l3">b站 <span class="tag">v2</span></span></li>
+              <li><span class="node l3">小红书 <span class="tag">v2</span></span></li>
+              <li><span class="node l3">预留 <span class="tag">v2</span></span></li>
+              <li><span class="node sup">来源标签 / 自动去重 <span class="tag t-new">补充</span></span></li>
+            </ul>
+          </li>
+          <li>
+            <span class="node l2">按类型分类</span>
+            <ul>
+              <li><span class="node l3">skill类</span></li>
+              <li><span class="node l3">常识类</span></li>
+              <li><span class="node sup">自动标签 / 手动打标 <span class="tag t-new">补充</span></span></li>
+            </ul>
+            <div class="note-box">
+              <b>注释位：</b>按类型分类需要 AI 处理数据后对知识类型重新分配标签，此处可能需要改动数据表增加字段。
+            </div>
+            <div class="note-box" style="margin-top:6px">
+              <b>联动设置：</b>按类型分类可能需要的参数及调整，建议收纳入设置界面统一管理。
+            </div>
+          </li>
+          <li>
+            <span class="node l2">配置API</span>
+            <span class="note">收纳入设置界面</span>
+          </li>
+          <li>
+            <span class="node l2">问答</span>
+            <ul>
+              <li><span class="node l3">按照全部知识库问答</span></li>
+              <li><span class="node l3">按照所选内容问答</span>
+                <ul>
+                  <li><span class="node l3">合理的展示内容</span></li>
+                  <li><span class="node l3">优先级最低：问答可以做到 agent 中</span></li>
+                </ul>
+              </li>
+              <li><span class="node sup">引用出处 / 追问 / 历史记录 <span class="tag t-new">补充</span></span></li>
+              <li><span class="node sup">相似度阈值 / topK 参数 <span class="tag t-new">补充</span></span></li>
+            </ul>
+          </li>
+        </ul>
+      </li>
+      <li>
+        <span class="node l1">🔧 设置</span>
+        <ul>
+          <li><span class="node l3">设置皮肤</span></li>
+          <li><span class="node l3">设置解析视频api</span></li>
+          <li><span class="node l3">设置解析语音api</span></li>
+          <li><span class="node l3">设置问答api</span></li>
+          <li><span class="node sup">通用模型配置 / API Key 管理 <span class="tag t-new">补充</span></span></li>
+          <li><span class="node sup">解析参数（并发 / 重试 / 缓存） <span class="tag t-new">补充</span></span></li>
+          <li><span class="node sup">数据存储路径 / 缓存清理 / 日志级别 <span class="tag t-new">补充</span></span></li>
+        </ul>
+      </li>
+    </ul>
+  </li>
+</ul>
+</div>
+
+</body>
+</html>

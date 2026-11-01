@@ -1,0 +1,35 @@
+# 把下面这段合并进 Hermes 的 ~/.hermes/config.yaml
+#
+# 注意：
+#   1. 如果 config.yaml 里已经有顶层 mcp_servers:，不要重复写第二个同名键，
+#      只把 tokbrain: 这一块加到已有的 mcp_servers 下面（YAML 对缩进极敏感，统一两个空格）。
+#   2. 192.168.10.100 是当前 PC 的局域网地址，PC 换 IP 后要同步改。
+#   3. 令牌不要明文写在这里。把真实令牌放进 NAS 上 Hermes 的 ~/.hermes/.env：
+#          TOKBRAIN_MCP_TOKEN=你的令牌
+#      然后 chmod 600 ~/.hermes/.env
+#   4. trust: untrusted + 全部工具自带 readOnlyHint，所以只读调用不需要人工审批。
+#
+# 与 8011 控制面并存
+# ------------------
+# 这只是 **只读快照** 通道。要让 Hermes 能导入、触发解析、启停服务，需要另外注册
+# `tokbrain_control`（8011）——完整片段见 hermes-control-config.example.yaml。
+# 两者并存不冲突（工具前缀 kb_* 与 tb_*），分工见 docs/tokbrain-control-plane.md。
+
+mcp_servers:
+  tokbrain:
+    url: "http://192.168.10.100:8010/mcp"
+    headers:
+      Authorization: "Bearer ${TOKBRAIN_MCP_TOKEN}"
+    enabled: true
+    timeout: 120
+    connect_timeout: 30
+    trust: untrusted
+    tools:
+      include:
+        - kb_search
+        - kb_get_work
+        - kb_get_transcript
+        - kb_list_collections
+        - kb_stats
+      resources: false
+      prompts: false

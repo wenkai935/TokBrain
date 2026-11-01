@@ -1,0 +1,7 @@
+# 抖音批量下载桥（tools/douyin_bridge/bridge_douyin.py）的可选依赖。
+# 仅下载板块需要，核心服务（API / 知识库 / 前端）不依赖，故独立成文件，
+# 由 scripts/setup.ps1 在主依赖安装后选择性安装，浏览器内核另用
+# `python -m playwright install chromium` 拉取。
+# 版本与本地已验证可用版本对齐（2026-11）。
+playwright==1.64.1
+yt-dlp==2026.10.26

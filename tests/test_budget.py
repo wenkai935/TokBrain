@@ -1,0 +1,270 @@
+import asyncio
+
+import pytest
+from datetime import date
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+import app.services.budget as budget
+import app.services.jobs as jobs
+from app.models import Base, DailyBudget, Job, UsageEvent, Work
+from app.services.providers import ProviderUsage
+
+
+async def budget_factory(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'budget.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    return engine, async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def test_concurrent_reservations_cannot_both_cross_token_limit(
+    tmp_path, monkeypatch
+):
+    engine, factory = await budget_factory(tmp_path)
+
+    async def limits(_session):
+        return {
+            "daily_media_minutes_limit": 60.0,
+            "daily_llm_token_limit": 1_000,
+        }
+
+    monkeypatch.setattr(budget, "get_runtime_settings", limits)
+
+    async def attempt():
+        async with factory() as session:
+            try:
+                await budget.reserve(session, works=0, llm_tokens=600)
+                await session.commit()
+                return "reserved"
+            except budget.BudgetExceeded:
+                await session.rollback()
+                return "rejected"
+
+    assert sorted(await asyncio.gather(attempt(), attempt())) == [
+        "rejected",
+        "reserved",
+    ]
+    async with factory() as session:
+        counter = await session.get(DailyBudget, budget.local_day())
+        assert counter is not None
+        assert counter.llm_tokens_reserved == 600
+    await engine.dispose()
+
+
+async def test_startup_recovery_clears_only_reserved_units(tmp_path, monkeypatch):
+    engine, factory = await budget_factory(tmp_path)
+
+    async def limits(_session):
+        return {
+            "daily_media_minutes_limit": 60.0,
+            "daily_llm_token_limit": 10_000,
+        }
+
+    monkeypatch.setattr(budget, "get_runtime_settings", limits)
+    async with factory() as session:
+        reservation = await budget.reserve(
+            session, works=1, media_minutes=3.5, llm_tokens=900
+        )
+        await session.commit()
+        await budget.consume(session, reservation, actual_llm_tokens=400)
+        await session.commit()
+        await budget.reserve(session, works=2, media_minutes=4.0, llm_tokens=700)
+        await session.commit()
+
+    async with factory() as session:
+        recovered = await budget.recover_stale_reservations(session)
+        await session.commit()
+        counter = await session.get(DailyBudget, budget.local_day())
+        assert recovered == budget.Reservation(2, 4.0, 700)
+        assert counter is not None
+        assert counter.works_reserved == 0
+        assert counter.media_minutes_reserved == 0
+        assert counter.llm_tokens_reserved == 0
+        assert counter.works_used == 1
+        assert counter.media_minutes_used == pytest.approx(3.5)
+        assert counter.llm_tokens_used == 400
+    await engine.dispose()
+
+
+async def test_failed_work_consumes_real_usage_without_counting_success(
+    tmp_path, monkeypatch
+):
+    engine, factory = await budget_factory(tmp_path)
+
+    async def limits(_session):
+        return {
+            "daily_media_minutes_limit": 60.0,
+            "daily_llm_token_limit": 10_000,
+        }
+
+    monkeypatch.setattr(budget, "get_runtime_settings", limits)
+    async with factory() as session:
+        reservation = await budget.reserve(
+            session, works=1, media_minutes=3.5, llm_tokens=900
+        )
+        await session.commit()
+        await budget.consume(
+            session,
+            reservation,
+            actual_works=0,
+            actual_llm_tokens=125,
+        )
+        await session.commit()
+        counter = await session.get(DailyBudget, budget.local_day())
+
+    assert counter is not None
+    assert counter.works_reserved == 0
+    assert counter.works_used == 0
+    assert counter.media_minutes_used == pytest.approx(3.5)
+    assert counter.llm_tokens_used == 125
+    await engine.dispose()
+
+
+async def test_reservation_settles_on_the_day_it_was_created(tmp_path, monkeypatch):
+    engine, factory = await budget_factory(tmp_path)
+    current_day = {"value": date(2026, 10, 30)}
+
+    async def limits(_session):
+        return {
+            "daily_media_minutes_limit": 60.0,
+            "daily_llm_token_limit": 10_000,
+        }
+
+    monkeypatch.setattr(budget, "get_runtime_settings", limits)
+    monkeypatch.setattr(budget, "local_day", lambda: current_day["value"])
+    async with factory() as session:
+        reservation = await budget.reserve(session, works=1, llm_tokens=900)
+        await session.commit()
+        current_day["value"] = date(2026, 10, 31)
+        await budget.consume(session, reservation, actual_llm_tokens=700)
+        await session.commit()
+        old_day = await session.get(DailyBudget, date(2026, 10, 30))
+        new_day = await session.get(DailyBudget, date(2026, 10, 31))
+
+    assert reservation.day == date(2026, 10, 30)
+    assert old_day is not None
+    assert old_day.llm_tokens_reserved == 0
+    assert old_day.llm_tokens_used == 700
+    assert new_day is None
+    await engine.dispose()
+
+
+async def test_unknown_model_usage_is_explicitly_unpriced(tmp_path):
+    engine, factory = await budget_factory(tmp_path)
+    usage = ProviderUsage("future-model", 12, 4, 0, quantity=16)
+    assert usage.priced is False
+
+    async with factory() as session:
+        await budget.record_usage(
+            session,
+            model=usage.model,
+            metric=usage.metric,
+            quantity=usage.quantity,
+            unit=usage.unit,
+            estimated_cost_cny=usage.cost_cny,
+        )
+        await session.commit()
+        event = await session.scalar(select(UsageEvent))
+        assert event is not None
+        assert event.estimated_cost_cny == 0
+        assert event.metadata_json["price_status"] == "unpriced"
+        assert event.metadata_json["unpriced"] is True
+
+    await engine.dispose()
+
+
+async def test_budget_deferred_works_resume_when_the_quota_day_rolls_over(tmp_path):
+    """A quota deferral must not outlive the day whose quota produced it.
+
+    The daily counter is keyed by the Shanghai date, so yesterday's exhausted
+    quota says nothing about today. The sweep re-queues the deferred works and
+    the enqueue clears their stale "已达到今日音视频分钟上限" stamp, which is what
+    the UI was still showing days later.
+    """
+
+    engine, factory = await budget_factory(tmp_path)
+    async with factory() as session:
+        for platform_work_id, state in (
+            ("deferred-pending", "pending"),
+            ("deferred-issues", "issues"),
+        ):
+            session.add(
+                Work(
+                    platform_work_id=platform_work_id,
+                    title=platform_work_id,
+                    library_state=state,
+                    processing_state="discovered",
+                    last_error_code="budget_deferred",
+                    process_error="已达到今日音视频分钟上限",
+                )
+            )
+        session.add(
+            Work(
+                platform_work_id="healthy",
+                title="healthy",
+                library_state="pending",
+                processing_state="discovered",
+            )
+        )
+        await session.commit()
+
+    async with factory() as session:
+        resumed = await jobs.resume_budget_deferred_works(session)
+        await session.commit()
+        assert len(resumed) == 2
+        works = {
+            work.platform_work_id: work
+            for work in (await session.execute(select(Work))).scalars()
+        }
+        assert works["deferred-pending"].last_error_code is None
+        assert works["deferred-pending"].process_error is None
+        assert works["deferred-issues"].last_error_code is None
+        assert works["deferred-issues"].process_error is None
+        assert works["healthy"].last_error_code is None
+        queued = (await session.execute(select(Job))).scalars().all()
+        assert len(queued) == 1
+        assert queued[0].job_type == "ingest"
+        assert queued[0].state == "queued"
+        assert sorted(queued[0].scope["work_ids"]) == sorted(resumed)
+
+    # The stamps are gone, so a second sweep on the same day has nothing to do.
+    async with factory() as session:
+        assert await jobs.resume_budget_deferred_works(session) == []
+    await engine.dispose()
+
+
+async def test_resume_skips_deferred_works_owned_by_an_active_job(tmp_path):
+    engine, factory = await budget_factory(tmp_path)
+    async with factory() as session:
+        session.add(
+            Work(
+                platform_work_id="deferred-active",
+                title="deferred-active",
+                library_state="pending",
+                processing_state="discovered",
+                last_error_code="budget_deferred",
+                process_error="已达到今日音视频分钟上限",
+            )
+        )
+        await session.commit()
+        work_id = await session.scalar(
+            select(Work.id).where(Work.platform_work_id == "deferred-active")
+        )
+        session.add(
+            Job(
+                id="active-job",
+                job_type="ingest",
+                state="running",
+                scope={"work_ids": [work_id]},
+            )
+        )
+        await session.commit()
+
+    async with factory() as session:
+        assert await jobs.resume_budget_deferred_works(session) == []
+        work = await session.scalar(select(Work))
+        assert work is not None
+        assert work.last_error_code == "budget_deferred"
+    await engine.dispose()
