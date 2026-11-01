@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "链接预检 → F2 联网解析（展开）",
+    "quality_profile": "standard",
+    "locale": "zh-CN",
+    "views": [
+      {
+        "id": "happy",
+        "label": "主路径",
+        "focus": ["post", "norm", "queued", "worker", "resolve", "crawler", "work"],
+        "note": "建批 → 归一化 → 入队 → 取件 → 解析 → 落 Work，蛇形折返"
+      },
+      {
+        "id": "throttle",
+        "label": "限流与熔断",
+        "focus": ["queued", "worker", "secret"],
+        "note": "日额度 150、队列 90、3 个 worker；串行闸 4–8s 冷却、429 熔断 30 分钟"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "post",
+      "type": "backend",
+      "label": "POST /api/import-batches",
+      "sublabel": "串行建批 · 150 条/日",
+      "pos": [40, 110],
+      "size": [162, 76],
+      "tag": "CREATE_IMPORT_LOCK"
+    },
+    {
+      "id": "norm",
+      "type": "backend",
+      "label": "归一化 + 去重",
+      "sublabel": "normalize → direct_work_id",
+      "pos": [300, 110],
+      "size": [162, 76],
+      "tag": "同批 + 历史"
+    },
+    {
+      "id": "queued",
+      "type": "messagebus",
+      "label": "status=queued",
+      "sublabel": "coordinator.enqueue",
+      "pos": [560, 110],
+      "size": [162, 76],
+      "tag": "maxsize=90"
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "3 × 预检 worker",
+      "sublabel": "queued → resolving",
+      "pos": [820, 110],
+      "size": [162, 76],
+      "tag": "只认 queued"
+    },
+    {
+      "id": "secret",
+      "type": "security",
+      "label": "get_secret(f2_cookie)",
+      "sublabel": "DPAPI 解密失败即判死",
+      "pos": [1080, 110],
+      "size": [176, 76],
+      "tag": "可选凭证却硬失败"
+    },
+    {
+      "id": "resolve",
+      "type": "cloud",
+      "label": "F2WorkClient.resolve",
+      "sublabel": "过 F2AccessGate · 冷却 4–8s",
+      "pos": [1080, 330],
+      "size": [176, 78],
+      "tag": "2 次尝试"
+    },
+    {
+      "id": "shortlink",
+      "type": "external",
+      "label": "短链解析",
+      "sublabel": "跟跳 ≤5 · 每跳 DNS 校验",
+      "pos": [820, 330],
+      "size": [162, 78],
+      "tag": "v.douyin.com"
+    },
+    {
+      "id": "crawler",
+      "type": "external",
+      "label": "DouyinCrawler",
+      "sublabel": "f2 库发请求 · 带 cookie",
+      "pos": [560, 330],
+      "size": [162, 78],
+      "tag": "禁系统代理"
+    },
+    {
+      "id": "filter",
+      "type": "cloud",
+      "label": "PostDetailFilter",
+      "sublabel": "压平字段 + 媒体策略",
+      "pos": [300, 330],
+      "size": [162, 78],
+      "tag": "fail-closed"
+    },
+    {
+      "id": "work",
+      "type": "database",
+      "label": "PublicWork → Work",
+      "sublabel": "confirm 建 pending · 再 ingest",
+      "pos": [40, 330],
+      "size": [162, 78],
+      "tag": "唯一写库方"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "建批与预检（本机 :8001）",
+      "wraps": ["post", "norm", "queued", "worker", "secret"]
+    },
+    {
+      "kind": "region",
+      "label": "F2 解析与落库",
+      "wraps": ["resolve", "shortlink", "crawler", "filter", "work"]
+    }
+  ],
+  "connections": [
+    { "id": "e1", "from": "post", "to": "norm", "label": "extract_links", "variant": "emphasis" },
+    { "id": "e2", "from": "norm", "to": "queued", "label": "写 status", "variant": "emphasis" },
+    { "id": "e3", "from": "queued", "to": "worker", "label": "asyncio", "variant": "emphasis" },
+    { "id": "e4", "from": "worker", "to": "secret", "label": "取 cookie" },
+    {
+      "id": "e5",
+      "from": "secret",
+      "to": "resolve",
+      "label": "cookie 入参",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [1276, 262]
+    },
+    { "id": "e6", "from": "resolve", "to": "shortlink", "label": "无 work_id", "variant": "dashed" },
+    { "id": "e7", "from": "shortlink", "to": "crawler", "label": "长链 id", "variant": "dashed" },
+    { "id": "e8", "from": "crawler", "to": "filter", "label": "payload", "variant": "emphasis" },
+    { "id": "e9", "from": "filter", "to": "work", "label": "PublicWork", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "orange",
+      "title": "三道闸全在这一段",
+      "items": [
+        "日额度 150 条（上海日切），用尽直接 429 daily_limit_exceeded",
+        "队列 maxsize=90，worker 只有 3 个，批量必然排队",
+        "串行闸是全局的：预检和媒体下载抢同一把锁，退出后冷却 4–8 秒"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "熔断 30 分钟",
+      "items": [
+        "429 rate_limited、风控 risk_verification、403 access_forbidden 会开熔断",
+        "熔断期间新批次直接 429，同批剩余 queued 全部置 blocked",
+        "network_timeout / server_error 不熔断，只重试 1 次、间隔 15–30 秒"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "f2 库只做两件事",
+      "items": [
+        "DouyinCrawler 发请求（带 cookie、显式禁系统代理）",
+        "PostDetailFilter 把嵌套 payload 压平成扁平字段",
+        "媒体直链来自解析结果，ingest 前还会再刷新一次"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,394 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "TokBrain 三条入料路径（总览）",
+    "quality_profile": "showcase",
+    "locale": "zh-CN",
+    "views": [
+      {
+        "id": "feishu",
+        "label": "飞书自动链路",
+        "focus": [
+          "phone",
+          "bitable",
+          "bridge",
+          "api",
+          "workers",
+          "f2",
+          "works"
+        ],
+        "note": "手机粘链接进表 → 桥轮询 → 预检调 F2 → 入库。当前生产主链路。"
+      },
+      {
+        "id": "web",
+        "label": "网页采集",
+        "focus": [
+          "web",
+          "pbatch",
+          "workers"
+        ],
+        "note": "pull / dom-collect 两条腿，批次写 pending，预检 worker 只认 queued。"
+      },
+      {
+        "id": "f2gate",
+        "label": "F2 与风控",
+        "focus": [
+          "f2",
+          "workers",
+          "douyin"
+        ],
+        "note": "全局串行闸 + 4–8s 冷却 + 30 分钟熔断，都在 F2 这一侧。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "phone",
+      "type": "external",
+      "label": "手机 · 飞书 App",
+      "sublabel": "人工把分享链接粘进表格",
+      "pos": [
+        40,
+        110
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "tag": "无脚本"
+    },
+    {
+      "id": "bitable",
+      "type": "cloud",
+      "label": "视频收藏表",
+      "sublabel": "「链接」列 + 9 个回写列",
+      "pos": [
+        300,
+        100
+      ],
+      "size": [
+        165,
+        80
+      ],
+      "tag": "多维表格"
+    },
+    {
+      "id": "state",
+      "type": "database",
+      "label": "同步状态.json",
+      "sublabel": "游标 + synced_record_ids",
+      "pos": [
+        300,
+        260
+      ],
+      "size": [
+        155,
+        62
+      ],
+      "tag": "三重去重之二"
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "同步桥 run_once",
+      "sublabel": "快轨收件 · 慢轨处理",
+      "pos": [
+        600,
+        100
+      ],
+      "size": [
+        160,
+        80
+      ],
+      "tag": "独立常驻进程"
+    },
+    {
+      "id": "dispatch",
+      "type": "database",
+      "label": "dispatch.db",
+      "sublabel": "队列与终态",
+      "pos": [
+        600,
+        260
+      ],
+      "size": [
+        155,
+        62
+      ],
+      "tag": "record_id 主键"
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "POST /api/import-batches",
+      "sublabel": "建批 · 去重 · 落 queued",
+      "pos": [
+        900,
+        100
+      ],
+      "size": [
+        175,
+        80
+      ],
+      "tag": "FASTAPI :8001"
+    },
+    {
+      "id": "workers",
+      "type": "backend",
+      "label": "3 × 预检 worker",
+      "sublabel": "只处理 status=queued",
+      "pos": [
+        900,
+        260
+      ],
+      "size": [
+        175,
+        68
+      ],
+      "tag": "队列上限 90"
+    },
+    {
+      "id": "f2",
+      "type": "cloud",
+      "label": "F2 解析服务",
+      "sublabel": "F2WorkClient + f2 库",
+      "pos": [
+        1220,
+        100
+      ],
+      "size": [
+        160,
+        80
+      ],
+      "tag": "串行闸 + 熔断"
+    },
+    {
+      "id": "douyin",
+      "type": "external",
+      "label": "抖音接口",
+      "sublabel": "短链 → 作品详情",
+      "pos": [
+        1520,
+        108
+      ],
+      "size": [
+        145,
+        64
+      ],
+      "tag": "需 f2_cookie"
+    },
+    {
+      "id": "works",
+      "type": "database",
+      "label": "知识库 works",
+      "sublabel": "confirm 建 pending → ingest",
+      "pos": [
+        1220,
+        290
+      ],
+      "size": [
+        160,
+        66
+      ],
+      "tag": "唯一写库方"
+    },
+    {
+      "id": "web",
+      "type": "frontend",
+      "label": "网页「导入」页",
+      "sublabel": "DOM 采集 · 勾选 · 本地上传",
+      "pos": [
+        300,
+        430
+      ],
+      "size": [
+        165,
+        68
+      ],
+      "tag": "无粘贴链接入口"
+    },
+    {
+      "id": "pbatch",
+      "type": "backend",
+      "label": "platform_pull 批次",
+      "sublabel": "pull / dom-collect 汇入",
+      "pos": [
+        600,
+        430
+      ],
+      "size": [
+        170,
+        68
+      ],
+      "tag": "items 写 pending"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "手机 / 飞书云端",
+      "wraps": [
+        "phone",
+        "bitable",
+        "state"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Windows 本机 · TokBrain",
+      "wraps": [
+        "bridge",
+        "dispatch",
+        "api",
+        "workers",
+        "f2",
+        "works",
+        "web",
+        "pbatch"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "互联网",
+      "wraps": [
+        "douyin"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "phone-bitable",
+      "from": "phone",
+      "to": "bitable",
+      "label": "粘贴分享文案",
+      "variant": "emphasis"
+    },
+    {
+      "id": "bitable-bridge",
+      "from": "bitable",
+      "to": "bridge",
+      "label": "isGreater(最后修改时间)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "state-bridge",
+      "from": "state",
+      "to": "bridge",
+      "label": "cursor + synced_ids",
+      "variant": "dashed"
+    },
+    {
+      "id": "bridge-dispatch",
+      "from": "bridge",
+      "to": "dispatch",
+      "label": "快轨 enqueue(pending)",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        692,
+        224
+      ]
+    },
+    {
+      "id": "bridge-api",
+      "from": "bridge",
+      "to": "api",
+      "label": "process_link(link)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "api-workers",
+      "from": "api",
+      "to": "workers",
+      "label": "coordinator.enqueue",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        999,
+        224
+      ]
+    },
+    {
+      "id": "workers-f2",
+      "from": "workers",
+      "to": "f2",
+      "label": "resolve(cookie)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "f2-douyin",
+      "from": "f2",
+      "to": "douyin",
+      "label": "DouyinCrawler",
+      "variant": "emphasis"
+    },
+    {
+      "id": "f2-works",
+      "from": "f2",
+      "to": "works",
+      "label": "PublicWork → ingest",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        1312,
+        246
+      ]
+    },
+    {
+      "id": "web-pbatch",
+      "from": "web",
+      "to": "pbatch",
+      "label": "pull / dom-collect"
+    },
+    {
+      "id": "pbatch-workers",
+      "from": "pbatch",
+      "to": "workers",
+      "label": "queued → 预检",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "三条路，现在都通",
+      "items": [
+        "手机 → 飞书表 → 桥 → 预检 → F2 → 入库：生产主链路，代码完整",
+        "网页采集：pull 与 dom-collect 采到的条目按平台分流进队列",
+        "HTTP 入站 API 是同一条管线的旁路，共用 dispatch 队列"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "平台采集的状态语义（已修）",
+      "items": [
+        "抖音：条目 queued 进预检，由 f2 解析媒体地址后下载",
+        "B站/小红书：没有解析器，直接 needs_local_file（元数据入库、视频补件）",
+        "批次状态跟着条目走：有排队条目是 queued，纯补件清单才是 succeeded"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "F2 这一侧的三道闸",
+      "items": [
+        "F2AccessGate：全局一把锁，一次只跑一个网络阶段，退出后冷却 4–8 秒",
+        "熔断：429 / 风控 / 403 触发，30 分钟内新批次直接 429",
+        "日额度：默认 150 条，按上海日切；跨天重置"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "手机端入口与「轮询」的分工",
+      "items": [
+        "手机把链接发给飞书 AI，由它写进多维表格——这段在飞书侧，不在本仓库",
+        "本机启动即拉起同步桥（start.ps1），它才是真正处理新行的地方",
+        "前端轮询只刷新状态数字，不导入任何东西——别把「行数变了」当成「处理了」",
+        "桥预检完停在「待确认」，网页勾选或 tb_sync_confirm 放行才解析入库"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,453 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "TokBrain 进程与信任边界（控制面已并入）",
+    "subtitle": "唯一写路径在 8001；控制面由 TokBrain.cmd control 起停；新增暴露面只有 8011",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "locale": "zh-CN",
+    "views": [
+      {
+        "id": "write-path",
+        "label": "唯一写路径",
+        "focus": [
+          "hermes",
+          "mcp8011",
+          "api",
+          "coord",
+          "db"
+        ],
+        "note": "外部 Agent 也只能经 8011 → 8001，没有任何旁路能直接写库。"
+      },
+      {
+        "id": "read-paths",
+        "label": "两条只读路径",
+        "focus": [
+          "hermes",
+          "stdio",
+          "snap",
+          "mcp8010",
+          "db"
+        ],
+        "note": "NAS 快照离线可用；8010 直连本机库，两者都不写。"
+      },
+      {
+        "id": "exposure",
+        "label": "对外暴露面",
+        "focus": [
+          "mcp8011",
+          "api",
+          "web"
+        ],
+        "note": "只有 8011 监听局域网，且必须显式开启并配 32 位令牌。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "stdio",
+      "type": "security",
+      "label": "stdio MCP",
+      "sublabel": "tokbrain_* 只读",
+      "pos": [
+        56,
+        170
+      ],
+      "size": [
+        136,
+        62
+      ]
+    },
+    {
+      "id": "snap",
+      "type": "database",
+      "label": "知识库快照",
+      "sublabel": "mode=ro immutable",
+      "pos": [
+        56,
+        430
+      ],
+      "size": [
+        136,
+        64
+      ]
+    },
+    {
+      "id": "hermes",
+      "type": "external",
+      "label": "Hermes",
+      "sublabel": "NAS 上的 Agent",
+      "pos": [
+        240,
+        300
+      ],
+      "size": [
+        144,
+        64
+      ],
+      "tag": "调用方"
+    },
+    {
+      "id": "web",
+      "type": "frontend",
+      "label": "网页前端 :3001",
+      "sublabel": "四页签",
+      "pos": [
+        470,
+        118
+      ],
+      "size": [
+        140,
+        62
+      ]
+    },
+    {
+      "id": "mcp8011",
+      "type": "security",
+      "label": "控制 MCP :8011",
+      "sublabel": "tb_* 33 工具 · 统一入口起停",
+      "pos": [
+        470,
+        300
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "唯一对外端口"
+    },
+    {
+      "id": "mcp8010",
+      "type": "backend",
+      "label": "只读 MCP :8010",
+      "sublabel": "kb_* 5 工具",
+      "pos": [
+        470,
+        480
+      ],
+      "size": [
+        140,
+        62
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "后端 :8001",
+      "sublabel": "FastAPI · 唯一写库方 · 契约 v7",
+      "pos": [
+        710,
+        300
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "契约 v7"
+    },
+    {
+      "id": "coord",
+      "type": "messagebus",
+      "label": "三个协调器",
+      "sublabel": "预检 ×3 / 数据包 / 入库 ×1",
+      "pos": [
+        920,
+        178
+      ],
+      "size": [
+        156,
+        64
+      ]
+    },
+    {
+      "id": "db",
+      "type": "database",
+      "label": "SQLite 主库",
+      "sublabel": "schema v11 · WAL",
+      "pos": [
+        920,
+        420
+      ],
+      "size": [
+        156,
+        64
+      ]
+    },
+    {
+      "id": "dashscope",
+      "type": "cloud",
+      "label": "百炼",
+      "sublabel": "ASR / OCR / 摘要 / 向量",
+      "pos": [
+        1160,
+        178
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "出网"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "NAS · 只读侧",
+      "wraps": [
+        "stdio",
+        "snap",
+        "hermes"
+      ],
+      "pad": 26
+    },
+    {
+      "kind": "region",
+      "label": "Windows 本机 · TokBrain 进程",
+      "wraps": [
+        "web",
+        "mcp8011",
+        "mcp8010",
+        "api",
+        "coord",
+        "db",
+        "dashscope"
+      ],
+      "pad": 26
+    },
+    {
+      "kind": "security-group",
+      "label": "仅回环 127.0.0.1",
+      "wraps": [
+        "web",
+        "mcp8010",
+        "api",
+        "coord",
+        "db"
+      ],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {
+      "id": "hermes-stdio",
+      "from": "hermes",
+      "to": "stdio",
+      "label": "stdio 拉起",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right",
+      "via": [
+        [
+          216,
+          332
+        ],
+        [
+          216,
+          201
+        ]
+      ],
+      "labelAt": [
+        158,
+        288
+      ]
+    },
+    {
+      "id": "stdio-snap",
+      "from": "stdio",
+      "to": "snap",
+      "label": "只读快照",
+      "variant": "dashed",
+      "route": "straight",
+      "labelAt": [
+        160,
+        352
+      ]
+    },
+    {
+      "id": "hermes-control",
+      "from": "hermes",
+      "to": "mcp8011",
+      "label": "HTTP + Bearer",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        427,
+        286
+      ]
+    },
+    {
+      "id": "control-api",
+      "from": "mcp8011",
+      "to": "api",
+      "label": "转发 REST",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        665,
+        286
+      ]
+    },
+    {
+      "id": "readonly-db",
+      "from": "mcp8010",
+      "to": "db",
+      "label": "只读直连",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          540,
+          642
+        ],
+        [
+          998,
+          642
+        ]
+      ],
+      "labelAt": [
+        760,
+        630
+      ]
+    },
+    {
+      "id": "web-api",
+      "from": "web",
+      "to": "api",
+      "label": "/api rewrite",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          540,
+          238
+        ],
+        [
+          785,
+          238
+        ]
+      ],
+      "labelAt": [
+        648,
+        226
+      ]
+    },
+    {
+      "id": "api-coord",
+      "from": "api",
+      "to": "coord",
+      "label": "入队",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "left",
+      "via": [
+        [
+          785,
+          272
+        ],
+        [
+          896,
+          272
+        ],
+        [
+          896,
+          210
+        ]
+      ],
+      "labelAt": [
+        840,
+        260
+      ]
+    },
+    {
+      "id": "coord-db",
+      "from": "coord",
+      "to": "db",
+      "label": "写 chunks",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [
+        1032,
+        342
+      ]
+    },
+    {
+      "id": "coord-model",
+      "from": "coord",
+      "to": "dashscope",
+      "label": "百炼调用",
+      "variant": "default",
+      "route": "straight",
+      "labelAt": [
+        1118,
+        164
+      ]
+    },
+    {
+      "id": "snapshot-deploy",
+      "from": "db",
+      "to": "snap",
+      "label": "手动 deploy 快照",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          998,
+          710
+        ],
+        [
+          124,
+          710
+        ]
+      ],
+      "labelAt": [
+        560,
+        698
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "写路径只有一条",
+      "items": [
+        "8001 是唯一写库方，控制面与 Agent 都不直接碰 SQLite",
+        "8011 只做转发：路由、鉴权、审计，然后调既有 REST",
+        "起停走同一套入口：TokBrain.cmd control 或菜单 [8]"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "只读路径有两条",
+      "items": [
+        "NAS 快照：PC 关机也能查历史，代价是需要手动 deploy",
+        "8010 只读 MCP：本机回环，Hermes 连不上，供本机工具用",
+        "两者都标了 readOnlyHint，不会改数据"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "新增暴露面只有 8011",
+      "items": [
+        "默认关闭：不设 TOKBRAIN_CONTROL_ENABLE=1 直接拒绝启动",
+        "非回环必须配 ≥32 位令牌，常量时间比较",
+        "防火墙只放行 /24 且限 private 配置；写操作全量审计"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "起停也在同一套入口里",
+      "items": [
+        "TokBrain.cmd control 或菜单 [8] 拉起 8011",
+        "停止仍由 scripts/stop.ps1 按 runtime.json 复核身份",
+        "8011 不受主服务 stop 管辖，关它不影响 TokBrain"
+      ]
+    }
+  ]
+}

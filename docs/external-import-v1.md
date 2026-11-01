@@ -1,5 +1,6 @@
 # TokBrain 外部批量导入 API v1
 
+> **时效声明（2026-10-30 校订）**：当前基线 API contract 7、schema v11、后端 `127.0.0.1:8001`。幂等重放已按要求修正：重放历史请求返回**与首次一致的 400/201 状态码**并带 `replayed=true`，不再一律返回 200。
 > **高级程序化接口，不是普通用户的日常导入路径。** 如果已经用 F2 或其他工具取得视频，
 > 请直接在 TokBrain 导入页的“外部视频数据包”选择下载文件夹或 ZIP。网页会自动识别
 > `douyin_videos.db`、JSON、CSV 和文件名；普通用户无需制作 manifest、生成 Bearer
@@ -9,7 +10,7 @@
 TokBrain。它只负责“清单 → 本地视频上传 → 提交”，不会抓取抖音、访问 F2、读取调用方
 给出的本机路径或下载远程 URL。
 
-服务地址固定为 `http://127.0.0.1:8000`。不要通过局域网、公网、反向代理或隧道暴露
+服务地址固定为 `http://127.0.0.1:8001`。不要通过局域网、公网、反向代理或隧道暴露
 该接口。
 
 ## 1. 准备令牌
@@ -215,7 +216,7 @@ py -3.12 .\scripts\push_to_tokbrain.py .\my-manifest.json `
 以下示例使用 PowerShell 与 Windows 自带的 `curl.exe`：
 
 ```powershell
-$base = "http://127.0.0.1:8000"
+$base = "http://127.0.0.1:8001"
 $token = $env:TOKBRAIN_IMPORT_TOKEN
 $key = "my-export-20260807-001"
 $manifest = @'
