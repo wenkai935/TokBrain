@@ -17,7 +17,8 @@ rem processes inherited and locked that file, so future restarts could not
 rem open it. The legacy log is no longer used.
 del /f /q "%~dp0data\logs\restart-control.log" >nul 2>&1
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1"
+if not exist "%~dp0data\logs" mkdir "%~dp0data\logs"
+start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& '%~dp0start.ps1' *> '%~dp0data\logs\startup-console.log'"
 set "start_exit_code=%ERRORLEVEL%"
 if not "%start_exit_code%"=="0" (
     echo.

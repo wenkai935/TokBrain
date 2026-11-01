@@ -195,7 +195,7 @@ class TokBrainClient:
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
             f"Content-Type: {content_type}\r\n\r\n"
-        ).encode("utf-8")
+        ).encode()
         trailer = f"\r\n--{boundary}--\r\n".encode("ascii")
         query = urlencode({"replace": str(replace).lower()})
         request_path = (
@@ -241,7 +241,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get("TOKBRAIN_API_URL", "http://127.0.0.1:8000"),
+        default=os.environ.get("TOKBRAIN_API_URL", "http://127.0.0.1:8001"),
         help="TokBrain 本机 API；可用 TOKBRAIN_API_URL 对齐自定义 APP_PORT",
     )
     parser.add_argument(

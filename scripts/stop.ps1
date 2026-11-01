@@ -199,9 +199,9 @@ function Stop-LegacyRuntime {
     $FrontendProcessId = Get-RuntimeInteger -RuntimeState $RuntimeState `
         -Name "frontend_pid"
     $BackendPort = Get-RuntimeInteger -RuntimeState $RuntimeState `
-        -Name "backend_port" -DefaultValue 8000
+        -Name "backend_port" -DefaultValue 8001
     $FrontendPort = Get-RuntimeInteger -RuntimeState $RuntimeState `
-        -Name "frontend_port" -DefaultValue 3000
+        -Name "frontend_port" -DefaultValue 3001
     $ExpectedApiContract = Get-RuntimeInteger -RuntimeState $RuntimeState `
         -Name "api_contract"
 

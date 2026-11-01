@@ -1,6 +1,7 @@
 ﻿param(
     [switch]$WithDev,
-    [switch]$WithoutBilling
+    [switch]$WithoutBilling,
+    [switch]$WithMcp
 )
 
 $ErrorActionPreference = "Stop"
@@ -175,6 +176,25 @@ if ($PyLauncher) {
     if ($HasRequestedVersion) {
         $PythonExecutable = $PyLauncher.Source
         $PythonPrefixArguments = @("-3.12")
+    }
+}
+
+if (-not $PythonExecutable -and $PyLauncher) {
+    # 兼容 uv / Astral 等带自定义 tag 的 Python 安装：这类环境没有 "3.12" 短别名，
+    # py -3.12 选不到它们，需要遍历 `py -0p` 列出的全部 tag 逐个校验。
+    $PyTagLines = & $PyLauncher.Source -0p 2>$null
+    foreach ($PyTagLine in $PyTagLines) {
+        if ($PyTagLine -notmatch '^\s*-V:(\S+)') { continue }
+        $CandidateTag = $Matches[1]
+        $HasRequestedVersion = Test-NativeCommand -FilePath $PyLauncher.Source -Arguments @(
+            "-V:$CandidateTag", "-c",
+            "import platform, sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) and platform.architecture()[0] == '64bit' else 1)"
+        )
+        if ($HasRequestedVersion) {
+            $PythonExecutable = $PyLauncher.Source
+            $PythonPrefixArguments = @("-V:$CandidateTag")
+            break
+        }
     }
 }
 
@@ -440,8 +460,80 @@ foreach ($ReplacedPath in @($OldVenvPath, $OldVendorPath)) {
     }
 }
 
-if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or
-    -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
-    Write-Warning "未同时检测到 ffmpeg 与 ffprobe。安装后加入 PATH；否则视频无法进入完整处理流水线。"
+if ($WithMcp) {
+    # The read-only MCP service needs its own venv: mcp 2.3.x requires
+    # pydantic>=2.12 / uvicorn>=0.31, which cannot coexist with the pins in
+    # requirements.txt. See requirements-mcp.txt for the rationale.
+    $McpVenvPath = Join-Path $WorkspacePath ".venv-mcp"
+    $McpPython = Join-Path $McpVenvPath "Scripts\python.exe"
+    Write-Host "正在准备 MCP 服务环境 .venv-mcp ..." -ForegroundColor Cyan
+    if (-not (Test-Path -LiteralPath $McpPython -PathType Leaf)) {
+        Invoke-NativeStep -FilePath $PythonExecutable -Arguments @(
+            $PythonPrefixArguments + @("-m", "venv", $McpVenvPath)
+        ) -FailureMessage "创建 MCP 服务虚拟环境失败。"
+    }
+    if (-not (Test-NativeCommand -FilePath $McpPython -Arguments @(
+                "-m", "pip", "--version"
+            ))) {
+        Invoke-NativeStep -FilePath $McpPython -Arguments @(
+            "-m", "ensurepip", "--upgrade"
+        ) -FailureMessage "MCP 环境缺少 pip，且 ensurepip 安装失败。"
+    }
+    Invoke-NativeStep -FilePath $McpPython -Arguments @(
+        "-m", "pip", "install", "-r",
+        (Join-Path $WorkspacePath "requirements-mcp.txt")
+    ) -FailureMessage "安装 MCP 服务依赖失败，请检查网络连接后重试。"
+    Invoke-NativeStep -FilePath $McpPython -Arguments @(
+        "-m", "pip", "check"
+    ) -FailureMessage "MCP 服务依赖存在版本冲突，请检查 requirements-mcp.txt。"
+    Invoke-NativeStep -FilePath $McpPython -Arguments @(
+        "-c",
+        "from mcp.server.mcpserver import MCPServer; import sqlalchemy, sqlite_vec, aiosqlite"
+    ) -FailureMessage "MCP 服务依赖校验失败：mcp / sqlalchemy / sqlite_vec 无法导入。"
+    Write-Host "MCP 服务环境已就绪：双击 mcp_server\启动MCP服务.cmd 启动。" -ForegroundColor Green
+}
+
+$FFmpegOnPath = (Get-Command ffmpeg -ErrorAction SilentlyContinue) -and
+    (Get-Command ffprobe -ErrorAction SilentlyContinue)
+$FFmpegCandidateDirs = @(
+    (Join-Path $WorkspacePath "tools\ffmpeg\bin"),
+    (Join-Path $WorkspacePath "ffmpeg\bin"),
+    "C:\ffmpeg\bin",
+    "D:\ffmpeg*\bin",
+    "D:\code\ffmpeg*\bin",
+    "D:\tools\ffmpeg*\bin"
+)
+$FFmpegLocated = $null
+if (-not $FFmpegOnPath) {
+    foreach ($CandidateDir in $FFmpegCandidateDirs) {
+        # Get-ChildItem -Filter does not expand wildcards in the -Path tail,
+        # so resolve the directory first and then probe for the executable.
+        foreach ($Directory in @(Get-Item -Path $CandidateDir `
+                    -ErrorAction SilentlyContinue |
+                    Sort-Object -Property FullName -Descending)) {
+            if (Test-Path -LiteralPath (Join-Path $Directory.FullName "ffmpeg.exe")) {
+                $FFmpegLocated = $Directory.FullName
+                break
+            }
+        }
+        if ($FFmpegLocated) {
+            break
+        }
+    }
+}
+if ($FFmpegOnPath) {
+    Write-Host "已检测到 ffmpeg / ffprobe。" -ForegroundColor DarkGray
+}
+elseif ($FFmpegLocated) {
+    Write-Host "ffmpeg 不在 PATH，但已在 $FFmpegLocated 找到；start.ps1 会自动注入。" `
+        -ForegroundColor DarkGray
+}
+else {
+    Write-Warning (
+        "未找到 ffmpeg / ffprobe。视频无法进入完整处理流水线。" +
+        "请安装 ffmpeg 并加入 PATH，或把便携版解压到 " +
+        (Join-Path $WorkspacePath "tools\ffmpeg") +
+        "，或设置环境变量 FFMPEG_BIN 指向其 bin 目录后重新启动。"
+    )
 }
 Write-Host "安装完成并已生成生产前端。运行 .\start.ps1 或双击 start.cmd。" -ForegroundColor Green
