@@ -1,0 +1,107 @@
+# Hermes MCP 注册片段：TokBrain 控制面（8011）
+#
+# 复制下面的 mcp_servers 内容合并进 NAS 上的 /vol1/1000/hermes-state/config.yaml，
+# 然后 `sudo systemctl restart hermes-household`。
+#
+# 合并前先备份：
+#   cp -p /vol1/1000/hermes-state/config.yaml \
+#         /vol1/1000/hermes-state/backups/config-before-control-$(date +%Y%m%d-%H%M).yaml
+#
+# 注意
+# ----
+# 1. 只贴 `tokbrain_control:` 那一段，**不要**重复写顶层 `mcp_servers:`。
+# 2. 192.168.10.100 是本机当前 LAN IP；换 IP 就要改这里和 Windows 防火墙。
+#    最好在路由器上给这台机器做 DHCP 保留。
+# 3. 令牌放 /vol1/1000/hermes-state/.env（chmod 600），不要写死在本文件里。
+#    取值：mcp_server/control.env 里的 TOKBRAIN_CONTROL_TOKEN。
+#    三个令牌（8010 / 8011 / 外部导入）必须互不相同。
+# 4. connect_timeout 故意设 10 秒而不是 30：PC 关机时让 Hermes 快点放弃，
+#    转而用 stdio 快照回答历史问题。
+#
+# 两个 server 的分工（写进 instructions 也写在这里）
+# -------------------------------------------------
+#   tokbrain          NAS 上的只读快照，快、离线可用；回答「收藏里讲过什么」
+#   tokbrain_control  实时控制面；回答「现在什么情况 / 帮我导入 / 重试失败」
+# 不要用一个去回答另一个的问题：用快照冒充操作结果是最坏的错误。
+
+mcp_servers:
+  # ---------------------------------------------------------------- 既有：只读快照
+  tokbrain:
+    url: "http://192.168.10.100:8010/mcp"
+    headers:
+      Authorization: "Bearer ${TOKBRAIN_MCP_TOKEN}"
+    enabled: true
+    timeout: 120
+    connect_timeout: 30
+    trust: untrusted
+    tools:
+      include:
+        - kb_search
+        - kb_get_work
+        - kb_get_transcript
+        - kb_list_collections
+        - kb_stats
+      resources: false
+      prompts: false
+
+  # ---------------------------------------------------------------- 新增：实时控制面
+  tokbrain_control:
+    url: "http://192.168.10.100:8011/mcp"
+    headers:
+      Authorization: "Bearer ${TOKBRAIN_CONTROL_TOKEN}"
+    enabled: true
+    timeout: 120
+    connect_timeout: 10
+    # trust 保持 untrusted：tb_search / tb_work_get 会返回视频字幕等外部内容，
+    # 把它们升格为"指令"是真正的安全退化。untrusted 只表示输出不可当指令，
+    # 不代表每个工具都要人工审批——审批看的是 annotations 的 destructiveHint。
+    trust: untrusted
+    tools:
+      # 首期 24 个：12 只读 + 7 个高频写 + 5 个飞书同步。观察一周再放下面注释掉的 9 个。
+      include:
+        - tb_status
+        - tb_service_status
+        - tb_job_list
+        - tb_job_get
+        - tb_job_wait
+        - tb_batch_get
+        - tb_work_list
+        - tb_work_get
+        - tb_collection_list
+        - tb_search
+        - tb_fs_roots
+        - tb_fs_probe
+        - tb_import_links
+        - tb_import_files
+        - tb_batch_confirm
+        - tb_library_ingest
+        - tb_work_retry
+        - tb_job_cancel
+        - tb_service_start
+        # ---- 飞书同步桥：处理「我加到飞书表的视频」这类请求 ----
+        # pending 是必给的：桥默认预检完就停在待确认，没有它 agent 不知道问什么。
+        # confirm 会真的下载并消耗额度，只放给已经过了你审核的场景。
+        - tb_sync_status
+        - tb_sync_pending
+        - tb_sync_start
+        - tb_sync_stop
+        - tb_sync_replay
+        - tb_sync_wait
+        - tb_sync_confirm
+      # ---- 观察稳定后再放开 ----
+      # - tb_import_package     目录数据包导入，慢
+      # - tb_batch_cancel
+      # - tb_work_supplement    补件
+      # - tb_work_restore
+      # - tb_collection_assign
+      # - tb_platform_pull      会出网抓平台，注意风控
+      # - tb_work_delete        永久删除，不可恢复
+      # - tb_service_stop       会让本机网页断开
+      # - tb_service_restart
+      resources: false
+      prompts: false
+
+# 如果 Hermes 的审批是本机弹窗式（无法远程点确认），
+# 把上面三个 destructive 工具的审批改成自动批准，否则远端调用会一直挂住。
+# 具体写法取决于 Hermes 版本，可先只放开 18 个工具、完全不碰 destructive，
+# 稳定几天后再决定是否加 tb_work_delete / tb_service_stop / tb_service_restart。
