@@ -15,13 +15,6 @@ TokBrain 是单机、单用户、本地优先的知识库应用。它只处理�
 
 当前应用版本为 **v1.0.0**，数据库迁移目标为 **schema v11**，API contract 为 **7**。默认服务只监听本机：前端 `127.0.0.1:3001`，后端 `127.0.0.1:8001`。
 
-## 架构地图
-
-<p align="center">
-  <img src="docs/diagrams/tokbrain-architecture.png" alt="TokBrain 架构地图：浏览器 → Next.js 前端(:3001) → FastAPI 后端(:8001，仅回环) → 服务层(32 模块 + 3 协调器) → SQLite 与本地媒体；外部依赖为阿里百炼 API、ffmpeg、平台站点、飞书多维表格；Hermes 经只读 MCP(:8010) 做问答检索" width="100%">
-</p>
-
-
 ## 当前能力
 
 | 能力 | 当前行为 |
@@ -64,6 +57,8 @@ flowchart LR
 
 `ffmpeg` 可以加入 PATH，也可以把便携版解压到 `tools\ffmpeg\bin`，或用环境变量 `FFMPEG_BIN` 指向它的 `bin` 目录——安装与启动脚本都会自动探测（见 `docs/TokBrain依赖与构建清单.md`）。
 
+抖音批量下载与浏览器解析通道属于可选能力，`install` 会自动补齐它们的依赖：安装 `requirements-download.txt`（Playwright + yt-dlp）并下载 Chromium 浏览器内核（`playwright install chromium`，下载失败仅警告、不中断核心安装）；浏览器解析所需的 `@playwright/cli` 随前端 `npm ci` 一并到位。飞书同步桥还需系统 `PATH` 中有 `lark-cli`（缺失时启动器会提示，不阻断核心服务）。
+
 ```powershell
 git clone https://github.com/fyfsxkh/TokBrain.git
 cd TokBrain
@@ -94,6 +89,7 @@ cd TokBrain
 原来的 `安装.cmd`、`setup.cmd`、`启动.cmd`、`start.cmd`、`停止.cmd`、`重启.cmd`、`dev.cmd` 仍然可用，行为不变，只是不再需要记哪一个。
 
 需要飞书 ↔ Obsidian 同步时，再单独双击 `启动飞书同步.cmd`——它是常驻独立进程，不随后端一起启动。
+从启动器菜单 `[9]` 启动会先弹出授权确认（列出数据访问范围并要求 `Y/N` 同意），避免误开一个会持续轮询飞书表的常驻进程。
 
 第一次使用：在“设置”保存模型 Key；在“导入”完成预检和确认；在“知识库”查看处理结果。需要问答或检索时使用下述 Hermes/MCP 接入；网页端当前没有“对话”入口。没有足够证据的问题必须返回“未找到”或要求补充，不会把标题或旧总结当成可靠事实。
 
@@ -153,6 +149,7 @@ tbctl.cmd                    控制面命令行入口（等价 python -m tokbrai
 bridge_feishu_obsidian.py    飞书 ↔ Obsidian ↔ TokBrain 同步桥（--watch 常驻）
 启动飞书同步.cmd             以 --watch 启动同步桥（独立进程，不随后端启动）
 cli/                         飞书扫码续期依赖的 @larksuite/cli
+tools/douyin_bridge/         抖音批量下载桥：浏览器驱动算出签名直链、yt-dlp 拉字节（可选能力）
 scripts/                     安装、启动、快照、部署、审计和验收脚本
 prototypes/                  历史交互原型（单文件 HTML，不由前端托管）
 tests/                       后端与前端契约测试

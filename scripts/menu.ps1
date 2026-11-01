@@ -387,17 +387,17 @@ function Invoke-Setup {
 
 function Invoke-ForegroundStart {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-        -File (Join-Path $Root "start.ps1")
+        -File (Join-Path $Root "launchers\start.ps1")
 }
 
 function Invoke-BackgroundStart {
-    $Launcher = Join-Path $Root "启动.cmd"
+    $Launcher = Join-Path $Root "launchers\启动.cmd"
     if (Test-Path -LiteralPath $Launcher) {
         & $Launcher
     }
     else {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File (Join-Path $Root "start.ps1")
+            -File (Join-Path $Root "launchers\start.ps1")
     }
 }
 
@@ -424,7 +424,7 @@ function Invoke-Stop {
 }
 
 function Invoke-DevMode {
-    & (Join-Path $Root "dev.cmd")
+    & (Join-Path $Root "launchers\dev.cmd")
 }
 
 function Get-UnmanagedSummary {
@@ -689,11 +689,39 @@ function Invoke-Control {
 function Invoke-Bridge {
     # 起停与查看统一走 tokbrain_control.bridge：与控制 MCP 的 tb_sync_* 是同一份实现，
     # 命令行能做的 MCP 都能做，反过来也成立。
-    param([string]$Sub = "status")
+    param(
+        [string]$Sub = "status",
+        [switch]$Confirm
+    )
     if (-not (Test-PathReady ".venv\Scripts\python.exe")) {
         Write-Host "  .venv 未安装，无法控制飞书同步桥。" -ForegroundColor Yellow
         Write-Host "  等价命令：.\scripts\setup.ps1" -ForegroundColor DarkGray
         return
+    }
+    if ($Sub -eq "start" -and $Confirm) {
+        # 飞书同步桥会访问用户已授权的飞书账号与多维表格，启动前必须确认授权范围。
+        $LarkCli = Get-Command lark-cli -ErrorAction SilentlyContinue
+        Write-Host ""
+        if (-not $LarkCli) {
+            Write-Host "  ⚠ 未检测到 lark-cli（飞书授权客户端）。" -ForegroundColor Yellow
+            Write-Host "  飞书同步桥需要 lark-cli 登录你的飞书账号才能读写多维表格。" -ForegroundColor White
+            Write-Host "  请先在设置页完成「飞书授权」，或安装 lark-cli 后再启动。" -ForegroundColor DarkGray
+            $Answer = Read-Host "  仍要尝试启动飞书同步桥？(y/N)"
+            if ($Answer -notmatch '^[yY]') {
+                Write-Host "  已取消启动。" -ForegroundColor Gray
+                return
+            }
+        }
+        else {
+            Write-Host "  飞书同步桥启动后将以下列身份访问你的飞书账号：" -ForegroundColor Cyan
+            Write-Host "    · 读取 / 写入你已授权的多维表格（视频链接、处理状态、标签等）" -ForegroundColor White
+            Write-Host "    · 通过 lark-cli device flow 使用你的访问令牌，仅在本地运行" -ForegroundColor White
+            $Answer = Read-Host "  确认启动飞书同步桥？(y/N)"
+            if ($Answer -notmatch '^[yY]') {
+                Write-Host "  已取消启动。" -ForegroundColor Gray
+                return
+            }
+        }
     }
     & (Join-Path $Root ".venv\Scripts\python.exe") -m tokbrain_control sync $Sub
 }
@@ -799,7 +827,7 @@ while ($true) {
                 Invoke-Bridge -Sub stop
             }
             else {
-                Invoke-Bridge -Sub start
+                Invoke-Bridge -Sub start -Confirm
             }
         }
         "10" { Invoke-OpenBrowser }

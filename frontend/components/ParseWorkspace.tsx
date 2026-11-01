@@ -60,6 +60,31 @@ function stageDone(status: string) {
 
 const PAGE_SIZE = 5;
 
+const PARSING_STATES = new Set(["queued", "resolving", "pending"]);
+const RETRYABLE_STATES = new Set(["failed", "cancelled", "blocked"]);
+
+const STAT_GROUPS: Array<{
+  key: string;
+  label: string;
+  match: (item: ImportItem) => boolean;
+}> = [
+  { key: "duplicate", label: "重复", match: (item) => item.status === "duplicate" },
+  { key: "cancelled", label: "中断", match: (item) => item.status === "cancelled" || item.status === "blocked" },
+  { key: "failed", label: "失败", match: (item) => item.status === "failed" },
+  { key: "needs_local_file", label: "需补件", match: (item) => item.status === "needs_local_file" },
+  { key: "resolving", label: "解析中", match: (item) => PARSING_STATES.has(item.status) },
+  { key: "ready", label: "可确认", match: (item) => item.status === "ready" },
+];
+
+const STAT_COLOR: Record<string, string> = {
+  duplicate: "#534AB7",
+  cancelled: "#BA7517",
+  failed: "#A32D2D",
+  needs_local_file: "#185FA5",
+  resolving: "#1D9E75",
+  ready: "#639922",
+};
+
 export function ParseWorkspace({
   hidden,
   batch,
@@ -73,7 +98,8 @@ export function ParseWorkspace({
   onConfirm,
   onDelete,
   onEdit,
-  onRetryFailedImports,
+  onBatchDelete,
+  onBatchRetry,
   settings,
   collections,
 }: {
@@ -89,11 +115,13 @@ export function ParseWorkspace({
   onConfirm: (itemIds: number[]) => void;
   onDelete: (item: ImportItem) => void;
   onEdit: (item: ImportItem, changes: ImportItemUpdate) => void;
-  onRetryFailedImports: () => void;
+  onBatchDelete: (itemIds: number[]) => void;
+  onBatchRetry: (itemIds: number[]) => void;
   settings: RuntimeSettings | null;
   collections: Collection[];
 }) {
   const [page, setPage] = useState(0);
+  const [activeStats, setActiveStats] = useState<Set<string>>(new Set());
   const active = batch && !["succeeded", "partial", "failed", "cancelled"].includes(batch.state);
   const manualCollectionId = collections.find((group) => group.key === "manual-import")?.id;
 
@@ -110,20 +138,47 @@ export function ParseWorkspace({
   const selectable = displayItems.filter((item) => item.status === "ready");
   const selectedVisible = selectable.filter((item) => selected.has(item.id));
 
-  const dup = displayItems.filter((item) => item.status === "duplicate").length;
-  const cancelled = displayItems.filter((item) => ["cancelled", "blocked"].includes(item.status)).length;
-  const failed = displayItems.filter((item) => item.status === "failed").length;
-  const needsLocal = displayItems.filter((item) => item.status === "needs_local_file").length;
-  const resolving = displayItems.filter((item) => ["queued", "resolving"].includes(item.status)).length;
-  const ready = displayItems.filter((item) => item.status === "ready").length;
-
   const totalPages = Math.max(1, Math.ceil(displayItems.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages - 1);
   const pagedItems = displayItems.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
 
+  const pageSelectable = pagedItems.filter((item) => !PARSING_STATES.has(item.status));
+  const pageSelected = pageSelectable.filter((item) => selected.has(item.id));
+  const allPageSelected = pageSelectable.length > 0 && pageSelected.length === pageSelectable.length;
+  const somePageSelected = pageSelected.length > 0 && !allPageSelected;
+
+  const selectedItems = displayItems.filter((item) => selected.has(item.id));
+  const deletableSelected = selectedItems.filter((item) => !PARSING_STATES.has(item.status));
+  const retryableSelected = selectedItems.filter((item) => RETRYABLE_STATES.has(item.status));
+
   function toggle(id: number, checked: boolean) {
     const next = new Set(selected);
     if (checked) next.add(id); else next.delete(id);
+    setSelected(next);
+  }
+
+  function toggleSelectAllPage() {
+    const next = new Set(selected);
+    if (allPageSelected) pageSelectable.forEach((item) => next.delete(item.id));
+    else pageSelectable.forEach((item) => next.add(item.id));
+    setSelected(next);
+  }
+
+  function toggleStat(group: typeof STAT_GROUPS[number]) {
+    const ids = displayItems.filter(group.match).map((item) => item.id);
+    const next = new Set(selected);
+    if (activeStats.has(group.key)) {
+      ids.forEach((id) => next.delete(id));
+      const updated = new Set(activeStats);
+      updated.delete(group.key);
+      setActiveStats(updated);
+    } else {
+      const toAdd = group.key === "duplicate" && ids.length > 1 ? ids.slice(1) : ids;
+      toAdd.forEach((id) => next.add(id));
+      const updated = new Set(activeStats);
+      updated.add(group.key);
+      setActiveStats(updated);
+    }
     setSelected(next);
   }
 
@@ -139,11 +194,6 @@ export function ParseWorkspace({
           </div>
           <div className="parse-header-actions">
             {!!selectable.length && (
-              <button className="parse-selectall" onClick={() => setSelected(new Set(selectable.map((item) => item.id)))}>
-                选择全部可确认项
-              </button>
-            )}
-            {!!selectable.length && (
               <button
                 className="btn primary parse-confirm-btn"
                 disabled={!selectedVisible.length || Boolean(busy)}
@@ -156,26 +206,53 @@ export function ParseWorkspace({
         </div>
 
         <div className="parse-stats">
-          <div className="parse-stat"><span className="parse-stat-l">重复</span><span className="parse-stat-n">{dup}</span></div>
-          <div className="parse-stat"><span className="parse-stat-l">中断</span><span className="parse-stat-n">{cancelled}</span></div>
-          <div className="parse-stat"><span className="parse-stat-l">失败</span><span className="parse-stat-n">{failed}</span></div>
-          <div className="parse-stat"><span className="parse-stat-l">需补件</span><span className="parse-stat-n">{needsLocal}</span></div>
-          <div className="parse-stat"><span className="parse-stat-l">解析中</span><span className="parse-stat-n">{resolving}</span></div>
-          <div className="parse-stat"><span className="parse-stat-l">可确认</span><span className="parse-stat-n">{ready}</span></div>
+          {STAT_GROUPS.map((group) => {
+            const count = displayItems.filter(group.match).length;
+            const isActive = activeStats.has(group.key);
+            return (
+              <button
+                type="button"
+                key={group.key}
+                className={`parse-stat${isActive ? " active" : ""}`}
+                style={isActive ? { background: STAT_COLOR[group.key], borderColor: STAT_COLOR[group.key] } : undefined}
+                disabled={count === 0}
+                onClick={() => toggleStat(group)}
+              >
+                <span className="parse-stat-l" style={isActive ? { color: "#fff" } : undefined}>{group.label}</span>
+                <span className="parse-stat-n" style={isActive ? { color: "#fff" } : undefined}>{count}</span>
+              </button>
+            );
+          })}
         </div>
 
         {!!displayItems.length && (
           <>
+            <div className="parse-selectall-row">
+              <div
+                className={`parse-checkbox${allPageSelected ? " on" : ""}${somePageSelected ? " partial" : ""}`}
+                role="checkbox"
+                aria-checked={allPageSelected ? "true" : somePageSelected ? "mixed" : "false"}
+                tabIndex={0}
+                onClick={toggleSelectAllPage}
+                onKeyDown={(event) => {
+                  if (event.key === " " || event.key === "Enter") toggleSelectAllPage();
+                }}
+              />
+              <span className="parse-selectall-label">全选本页</span>
+              <span className="parse-selectall-hint">仅当前页</span>
+            </div>
+
             <div className="parse-results">
               {pagedItems.map((item) => {
                 const done = stageDone(item.status);
                 const fill = Math.round((done / (PARSE_STAGES.length - 1)) * 100);
                 const fullTitle = item.title || item.input_url || "";
                 const displayTitle = fullTitle.length > 20 ? `${Array.from(fullTitle).slice(0, 20).join("")}…` : fullTitle;
+                const selectableItem = !PARSING_STATES.has(item.status);
                 return (
                   <div className="parse-result" data-id={item.id} data-state={item.status} key={item.id}>
                     <div className="parse-result-top">
-                      {item.status === "ready" ? (
+                      {selectableItem ? (
                         <div
                           className={`parse-checkbox ${selected.has(item.id) ? "on" : ""}`}
                           role="checkbox"
@@ -192,7 +269,7 @@ export function ParseWorkspace({
                       <div className="parse-result-title" title={fullTitle}>
                         {displayTitle}
                       </div>
-                      {["queued", "resolving", "pending"].includes(item.status) ? (
+                      {PARSING_STATES.has(item.status) ? (
                         <span className="parse-status-anim">
                           <span className="parse-spin" />
                           <span className="parse-status-txt">{itemStatus(item)}</span>
@@ -250,7 +327,7 @@ export function ParseWorkspace({
                     )}
 
                     <div className="parse-actions">
-                      {!["queued", "resolving"].includes(item.status) && (
+                      {selectableItem && (
                         <button className="parse-del" onClick={() => onDelete(item)}>删除预检结果</button>
                       )}
                     </div>
@@ -274,6 +351,27 @@ export function ParseWorkspace({
                 <button className="parse-page-btn" disabled={safePage >= totalPages - 1} onClick={() => setPage(safePage + 1)}>›</button>
               </div>
             )}
+
+            {selected.size > 0 && (
+              <div className="parse-batch-bar">
+                <button
+                  type="button"
+                  className="parse-batch-del"
+                  disabled={Boolean(busy) || !deletableSelected.length}
+                  onClick={() => onBatchDelete(deletableSelected.map((item) => item.id))}
+                >
+                  删除所选项（{deletableSelected.length}）
+                </button>
+                <button
+                  type="button"
+                  className="parse-batch-retry"
+                  disabled={Boolean(busy) || !retryableSelected.length}
+                  onClick={() => onBatchRetry(retryableSelected.map((item) => item.id))}
+                >
+                  重试所选项（{retryableSelected.length}）
+                </button>
+              </div>
+            )}
           </>
         )}
 
@@ -288,10 +386,6 @@ export function ParseWorkspace({
             </button>
           </div>
         )}
-
-        <div className="parse-actions" style={{ justifyContent: "flex-start", marginTop: 4 }}>
-          <button className="parse-del" disabled={Boolean(busy)} onClick={onRetryFailedImports}>重试失败导入</button>
-        </div>
       </div>
 
       <ModelConfig settings={settings} />

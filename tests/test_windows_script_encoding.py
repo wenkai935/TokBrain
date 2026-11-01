@@ -107,3 +107,12 @@ def test_prepublish_uses_a_workspace_owned_pytest_temp_directory():
         encoding="utf-8-sig"
     )
     assert '--basetemp ".test-tmp\\prepublish"' in prepublish
+
+
+def test_managed_start_supervises_and_cleans_up_the_feishu_bridge():
+    startup = (ROOT / "launchers" / "start.ps1").read_text(encoding="utf-8-sig")
+    assert "$BridgeProcessId = Start-FeishuBridge" in startup
+    assert "Get-Process -Id $BridgeProcessId" in startup
+    assert "飞书同步桥已退出，正在自动重启" in startup
+    assert "-BridgeScriptPath" in startup
+    assert "Stop-FeishuBridge" in startup

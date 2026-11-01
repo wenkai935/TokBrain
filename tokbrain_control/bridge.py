@@ -59,7 +59,10 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
 def _python() -> str:
-    """优先用项目 .venv：bridge 依赖 requests 等第三方包，系统 python 不一定有。"""
+    """优先用可用的下载环境，回退到项目 .venv。"""
+    workbuddy = Path(r"C:\Users\xxsyl\.workbuddy\binaries\python\envs\default\Scripts\python.exe")
+    if workbuddy.is_file():
+        return str(workbuddy)
     candidate = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
     if candidate.is_file():
         return str(candidate)
@@ -470,6 +473,18 @@ def start(
     env.setdefault("VAULT_PATH", DEFAULT_VAULT)
     env["FS_NO_DOUYIN"] = "0" if download else "1"
     env["FS_AUTO_CONFIRM"] = "1" if auto_confirm else "0"
+    lark_exe = Path(r"C:\Users\xxsyl\.trae-cn\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe")
+    if lark_exe.is_file():
+        env["LARK_CLI_EXE"] = str(lark_exe)
+        env["LARK_CLI_DIR"] = str(lark_exe.parent.parent)
+    # WorkBuddy 环境提供 yt-dlp/Playwright；项目环境提供 requests 等桥依赖。
+    # 两者均在本机，按路径合并，避免把下载能力锁死在 .venv。
+    project_site = PROJECT_ROOT / ".venv" / "Lib" / "site-packages"
+    if project_site.is_dir():
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in [str(project_site), str(PROJECT_ROOT), existing_pythonpath] if part
+        )
     # bridge 用 requests，而 requests 默认 trust_env：系统里配了 HTTP_PROXY
     # （Clash/VPN/CI 都会配）时，连 http://127.0.0.1:8001 也会被推给代理，
     # 代理按 absolute-form 转发，后端收到 path 是 "http://127.0.0.1:8001/api/..."
@@ -484,8 +499,13 @@ def start(
         return {"started": False, "error": f"打不开日志文件：{exc}"}
 
     try:
+        args = [_python(), "-u", str(BRIDGE_SCRIPT), "--watch"]
+        if download:
+            args.append("--download")
+        if auto_confirm:
+            args.append("--auto-confirm")
         proc = subprocess.Popen(  # noqa: S603 - 固定脚本路径，无用户输入拼接
-            [_python(), "-u", str(BRIDGE_SCRIPT), "--watch"],
+            args,
             cwd=str(PROJECT_ROOT),
             env=env,
             stdin=subprocess.DEVNULL,
@@ -811,6 +831,7 @@ def replay(
     *,
     newest_first: bool = False,
     record_ids: list[str] | None = None,
+    include_processed: bool = False,
     caller: str | None = None,
 ) -> dict[str, Any]:
     """把 ``limit`` 条 failed 重投回慢轨（状态改为 queued）。
@@ -827,6 +848,12 @@ def replay(
     from .errors import CODE_INVALID_ARGUMENT, ControlError
 
     wanted: list[str] = []
+    if include_processed and not record_ids:
+        raise ControlError(
+            CODE_INVALID_ARGUMENT,
+            "include_processed 只能与明确的 record_ids 一起使用",
+            kind="usage",
+        )
     if record_ids:
         wanted = list(
             dict.fromkeys(str(rid).strip() for rid in record_ids if str(rid).strip())
@@ -875,7 +902,7 @@ def replay(
         if wanted:
             placeholders = ",".join("?" * len(wanted))
             rows = con.execute(
-                f"SELECT record_id, link FROM dispatch WHERE status='failed' "
+                f"SELECT record_id, link FROM dispatch WHERE status IN ('failed'" + (",'processed'" if include_processed else "") + ") "
                 f"AND record_id IN ({placeholders})",
                 wanted,
             ).fetchall()
@@ -886,7 +913,7 @@ def replay(
             rows = sorted(rows, key=lambda row: order_map.get(row["record_id"], 0))
         else:
             rows = con.execute(
-                f"SELECT record_id, link FROM dispatch WHERE status='failed' "
+                f"SELECT record_id, link FROM dispatch WHERE status IN ('failed'" + (",'processed'" if include_processed else "") + ") "
                 f"ORDER BY updated_at {order} LIMIT ?",
                 (count,),
             ).fetchall()
@@ -932,9 +959,11 @@ def replay(
     if skipped:
         data["skipped"] = skipped
         data["skipped_hint"] = (
-            "这些 record_id 当前不是 failed（可能已处理、或库里没有），未重投；"
+            "这些 record_id 当前不是可重投状态（可能已处理、或库里没有）；"
             "确认拼写后再试，或先用 tb_sync_pending 看当前队列。"
         )
+    if include_processed:
+        data["note"] = "已显式允许 processed 重跑；如桥为 download 模式，将重新触发下载/解析。"
     if mode.get("mode") == "metadata_only":
         data["warning"] = (
             "当前桥是 metadata_only 模式：重投后只会重建占位，**不会下载视频**。"

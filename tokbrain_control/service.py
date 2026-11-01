@@ -49,7 +49,7 @@ BACKEND_PORT = 8001
 FRONTEND_PORT = 3001
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 
-START_SCRIPT = PROJECT_ROOT / "启动.cmd"
+START_SCRIPT = PROJECT_ROOT / "launchers" / "启动.cmd"
 STOP_SCRIPT = PROJECT_ROOT / "scripts" / "stop.ps1"
 
 START_TIMEOUT = 40.0
@@ -354,7 +354,7 @@ def start(*, timeout: float = START_TIMEOUT) -> dict[str, Any]:
                 CODE_START_FAILED,
                 f"找不到启动脚本：{START_SCRIPT}",
                 kind="local",
-                hint="项目根目录应包含 启动.cmd；确认 PROJECT_ROOT 正确。",
+                hint="launchers 目录应包含 启动.cmd；确认 PROJECT_ROOT 正确。",
             )
         if before["state"] == "orphan" and not before["runtime_json"].get("exists"):
             raise ControlError(

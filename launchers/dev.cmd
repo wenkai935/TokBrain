@@ -1,13 +1,13 @@
 @echo off
 chcp 65001 >nul
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo Starting TokBrain BACKEND on 127.0.0.1:8001 ...
 start "TokBrain Backend :8001" cmd /k ".venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8001"
 
 echo Starting TokBrain FRONTEND (hot reload) on 127.0.0.1:3001 ...
-cd /d "%~dp0frontend"
+cd /d "%~dp0..\frontend"
 start "TokBrain Frontend dev :3001" cmd /k "npm run dev"
 
 echo.

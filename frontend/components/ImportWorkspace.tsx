@@ -668,6 +668,7 @@ function NetworkImport({
 }
 
 const TERMINAL_JOB_STATES = new Set(["succeeded", "partial", "failed", "cancelled", "await_fix"]);
+const SUCCESS_JOB_STATES = new Set(["succeeded", "partial"]);
 
 function WorksLibrary() {
   const [works, setWorks] = useState<Work[]>([]);
@@ -763,7 +764,6 @@ function ImportProgress({
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   const activeCount = jobs.filter((job) => !TERMINAL_JOB_STATES.has(job.state)).length;
-  const [collapsed, setCollapsed] = useState(activeCount === 0);
 
   async function refresh() {
     setSpinning(true);
@@ -783,10 +783,13 @@ function ImportProgress({
 
   const visibleJobs = jobs.filter((job) => !dismissed.has(job.id));
   const hasFailed = jobs.some((job) => job.state === "failed");
-  const completedCount = jobs.filter((job) => TERMINAL_JOB_STATES.has(job.state)).length;
+  const completedCount = jobs.filter((job) => SUCCESS_JOB_STATES.has(job.state)).length;
 
-  function clearCompleted() {
-    setDismissed(new Set(jobs.filter((job) => TERMINAL_JOB_STATES.has(job.state)).map((job) => job.id)));
+  async function clearCompleted() {
+    await perform("clear-completed-jobs", async () => {
+      await api.clearCompletedJobs();
+      await onRefresh();
+    }, "已清除并释放已完成任务缓存");
   }
 
   function dismissJob(id: string) {
@@ -804,8 +807,8 @@ function ImportProgress({
 
   return (
     <div className="card sup">
-      <div className="card-h" onClick={() => setCollapsed((v) => !v)} role="button" aria-expanded={!collapsed} title="点击展开/收起">
-        <span className="chev">{collapsed ? "▸" : "▾"}</span>
+      <div className="card-h">
+        <span className="chev">▾</span>
         <div className="t">导入进度</div>
         {activeCount > 0 && <span className="n">{activeCount} 进行中</span>}
         <span className="tag t-sup">补充</span>
@@ -852,8 +855,6 @@ function ImportProgress({
           </button>
         </div>
       </div>
-      {!collapsed && (
-        <>
       {visibleJobs.length ? (
         <div
           className="task-list"
@@ -880,7 +881,7 @@ function ImportProgress({
                     重试
                   </button>
                 )}
-                {terminal && (
+                {terminal && !SUCCESS_JOB_STATES.has(job.state) && (
                   <button className="tdismiss" title="从列表移除" onClick={() => dismissJob(job.id)}>×</button>
                 )}
               </div>
@@ -891,16 +892,17 @@ function ImportProgress({
         <div className="task-empty">暂无导入任务</div>
       )}
       {dismissed.size > 0 && (
-        <button className="text-btn ghost" style={{ marginTop: 8 }} onClick={() => setDismissed(new Set())}>
-          显示已隐藏的 {dismissed.size} 条任务
-        </button>
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+          <button className="text-btn ghost" onClick={() => setDismissed(new Set())}>
+            恢复非成功项目（{dismissed.size}）
+          </button>
+        </div>
       )}
       {hasFailed && (
         <div className="note" style={{ marginTop: 10 }}>
           导入后触发：启动前端查询 → 开始轮询 → 进入解析流程。失败条目可在解析页补件后重试。
         </div>
       )}
-        </>)}
     </div>
   );
 }

@@ -2,6 +2,30 @@
 
 本文件记录 TokBrain 面向用户的重要版本变化。版本日期采用上海时区。
 
+## [Unreleased] — 2026-11-02 · 下载板块入库 + 安装自动补依赖 + 飞书桥授权确认
+
+clone 用户此前拿不到下载脚本（它躺在 `D:/Temp`，不在版本库），且 `install` 不装 Playwright / yt-dlp / Chromium，导致下载板块与浏览器解析通道在他人机器上根本跑不起来。
+
+- 下载脚本 `bridge_douyin.py` 移入 `tools/douyin_bridge/` 并纳入版本管理；硬编码路径全部相对化：`_PROJECT_ROOT` 由 `__file__` 推导，Chrome / ffmpeg 改走 `CHROME_PATH` / `FFMPEG_BIN` → PATH → 常见目录探测，Cookie 默认 `data/cookies`（`TOKBRAIN_COOKIE_DIR` 可覆盖）。
+- 新增 `requirements-download.txt`（playwright、yt-dlp）；`scripts/setup.ps1` 在主依赖装完后安装它并执行 `python -m playwright install chromium`，失败仅警告、不中断核心安装。
+- 前端 `package.json` 加 `optionalDependencies: @playwright/cli`，抖音浏览器解析通道随 `npm ci` 到位。
+- 飞书桥 `[9]` 启动前加授权确认：列出数据访问范围并要求 `Y/N` 同意；不同意则取消。命令行 `bridge-start` 保持非交互直接启动。
+- 启动器状态面板把下载 / 解析 / 飞书桥依赖纳入检测（Playwright、playwright-cli、Chrome、ffprobe、yt-dlp、lark-cli），缺失标黄。详见 [完整变更日志](docs/CHANGELOG-FULL.md)。
+
+## [Unreleased] — 2026-11-02 · 日额度跨日重置：延后作品自动续跑
+
+额度爆掉被延后的作品，第二天额度已经重置，卡片却还挂着昨天的「已达到今日音视频
+分钟上限」——`budget_deferred` 这个戳打上去之后就再没人管。文档里写的「延后非失败，
+明天额度重置自动重试」其实一直没有实现，只能手动点「开始入库」。
+
+- 处理协调器每次循环对一遍上海时区日期：一跨天（以及每次启动后的第一圈），就把
+  仍带 `budget_deferred` 戳、且不在活跃任务里的作品重新排队；排队即清掉旧错误戳。
+  若今天额度仍然爆掉，新的尝试会当场重新打戳，消息保持真实。
+- `enqueue_ingest_job` 统一清理被排队作品的旧错误戳：单个「开始入库」早就清，
+  批量入口不清，导致排队期间卡片一直显示上一次尝试的错误。
+- 额度会计本身（按天一行计数器、跨零点按上海日期结算）没有问题，坏的只是
+  「跨天之后把延后作品捞回来」这一段。
+
 ## [Unreleased] — 2026-11-02 · 控制台补上「停止开发模式实例」
 
 `[4] 停止服务` 点下去没反应，不是脚本坏了，是两套进程视图没接上：`stop.ps1` 只认

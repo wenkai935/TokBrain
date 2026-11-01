@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from contextlib import suppress
+from datetime import date
 
 from loguru import logger
 from sqlalchemy import and_, func, or_, select, update
@@ -25,6 +26,7 @@ from app.services.budget import (
     BudgetExceeded,
     consume,
     estimate_video_ingest_units,
+    local_day,
     record_usage,
     recover_stale_reservations,
     release,
@@ -430,6 +432,19 @@ async def _enqueue_ingest_job(
         )
         .values(supplement_state="processing")
     )
+    # A freshly queued attempt makes any previous error stamp stale: the new run
+    # re-stamps on failure (e.g. budget_deferred while the daily quota is still
+    # exhausted) or clears it on success. Without this, batch-enqueued works keep
+    # showing the previous attempt's error - including a "已达到今日音视频分钟上限"
+    # left over from an earlier day, which reads as "the daily quota never reset".
+    await session.execute(
+        update(Work)
+        .where(
+            Work.id.in_(valid),
+            Work.last_error_code.is_not(None),
+        )
+        .values(process_error=None, last_error_code=None)
+    )
     # Commit before releasing the process-local enqueue lock so the next request
     # sees this active scope instead of creating a concurrent duplicate.
     await _commit_transaction(session)
@@ -534,6 +549,41 @@ async def retry_failed_imports(session: AsyncSession) -> dict:
         "retried": job.total_items,
         "message": f"已重新排入 {job.total_items} 个失败导入",
     }
+
+
+async def resume_budget_deferred_works(session: AsyncSession) -> list[int]:
+    """Re-queue works deferred by an exhausted daily quota.
+
+    Budget deferral is not a failure: the daily counter is keyed by the Shanghai
+    calendar day, so the quota that blocked these works stops existing at
+    midnight. Without this sweep the ``budget_deferred`` stamp - and its
+    "已达到今日音视频分钟上限" message - survives the rollover and keeps works
+    looking blocked by a limit that has already reset. Re-enqueueing them (which
+    also clears the stamp) gives the new day's quota a chance to pick them up
+    automatically, matching the documented behaviour "延后非失败，明天额度重置
+    自动重试". Works still owned by an active job are left to that job.
+    """
+
+    deferred_ids = list(
+        (
+            await session.execute(
+                select(Work.id).where(Work.last_error_code == "budget_deferred")
+            )
+        ).scalars()
+    )
+    if not deferred_ids:
+        return []
+    active = await _active_work_ids(session)
+    candidates = [int(item) for item in deferred_ids if int(item) not in active]
+    if not candidates:
+        return []
+    try:
+        await enqueue_ingest_job(session, candidates)
+    except ValueError:
+        # Not re-ingestable right now; the owning job re-stamps or clears the
+        # error when it reaches the work.
+        return []
+    return candidates
 
 
 async def _is_cancelling(session: AsyncSession, job: Job) -> bool:
@@ -1126,6 +1176,7 @@ class JobCoordinator:
         self.stop_event = asyncio.Event()
         self.task: asyncio.Task | None = None
         self.last_error: str | None = None
+        self._resumed_day: date | None = None
 
     def health_snapshot(self) -> dict[str, object]:
         alive = bool(self.task and not self.task.done())
@@ -1145,6 +1196,9 @@ class JobCoordinator:
         if self.task and not self.task.done():
             return
         self.last_error = None
+        # Unknown until the first loop iteration: an app (re)started on a new day
+        # must sweep immediately so yesterday's deferred works get a fresh chance.
+        self._resumed_day = None
         async with async_session_factory() as session:
             recovered = await recover_stale_reservations(session)
             await _commit_transaction(session)
@@ -1171,8 +1225,35 @@ class JobCoordinator:
                 await asyncio.gather(self.task, return_exceptions=True)
         self.task = None
 
+    async def _resume_deferred_on_new_day(self) -> None:
+        """Give budget-deferred works a fresh chance whenever the quota day changes.
+
+        The daily budget resets at Shanghai midnight, so a ``budget_deferred``
+        stamp written yesterday must not keep a work blocked today. Runs at most
+        once per calendar day (plus once after startup); works deferred again
+        because today's quota is still exhausted are simply re-stamped by the
+        fresh attempt.
+        """
+
+        today = local_day()
+        if self._resumed_day == today:
+            return
+        self._resumed_day = today
+        try:
+            async with async_session_factory() as session:
+                resumed = await resume_budget_deferred_works(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.last_error = safe_error_message(exc)
+            logger.exception("跨日恢复预算延后作品失败")
+            return
+        if resumed:
+            logger.info("日额度已重置，自动重新排队 {} 个延后作品", len(resumed))
+
     async def _loop(self) -> None:
         while not self.stop_event.is_set():
+            await self._resume_deferred_on_new_day()
             try:
                 async with async_session_factory() as session:
                     job = (

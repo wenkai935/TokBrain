@@ -318,6 +318,7 @@ def sync_replay(
     limit: int = 5,
     newest_first: bool = False,
     record_ids: list[str] | None = None,
+    include_processed: bool = False,
     *,
     caller: str | None = None,
 ):
@@ -326,6 +327,7 @@ def sync_replay(
             limit,
             newest_first=newest_first,
             record_ids=record_ids,
+            include_processed=include_processed,
             caller=caller,
         )
 
@@ -336,6 +338,7 @@ def sync_replay(
             "limit": limit,
             "newest_first": newest_first,
             "record_ids": record_ids,
+            "include_processed": include_processed,
         },
         write=True,
         caller=caller,

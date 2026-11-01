@@ -32,7 +32,7 @@ import {
 import { mergeWorksPage } from "../lib/libraryPagination";
 import { activeProcessingJobIds, didAnyJobReachTerminal, isActiveProcessingJob, operationIncludesJob } from "../lib/jobPolling";
 import type { LibraryState } from "../lib/uiTypes";
-import { rememberImportBatch, rememberLocalImportRightsAttestation, storedImportBatchIds, storedLocalImportRightsAttestation } from "../lib/importBatchStorage";
+import { forgetImportBatch, rememberImportBatch, rememberLocalImportRightsAttestation, storedImportBatchIds, storedLocalImportRightsAttestation } from "../lib/importBatchStorage";
 import { useTheme } from "../themes/ThemeProvider";
 
 type Tab = "import" | "parse" | "library" | "settings";
@@ -472,6 +472,9 @@ export default function Home() {
       if (!ids.length) return;
       const settled = await Promise.allSettled(ids.map((id) => api.importBatch(id)));
       if (cancelled) return;
+      settled.forEach((result, index) => {
+        if (result.status === "rejected") forgetImportBatch(ids[index]);
+      });
       const loaded = settled
         .filter((result): result is PromiseFulfilledResult<ImportBatch> => result.status === "fulfilled")
         .map((result) => result.value)
@@ -489,6 +492,11 @@ export default function Home() {
           return { ...entry, items };
         })
         .filter((entry) => !batchIsTerminal(entry) || entry.items.length);
+      loaded.forEach((entry) => {
+        if (batchIsTerminal(entry) && !recovered.some((item) => item.id === entry.id)) {
+          forgetImportBatch(entry.id);
+        }
+      });
       if (!recovered.length) {
         setRetainedBatches((current) => current.filter((entry) => !loadedIds.has(entry.id)));
         return;
@@ -885,16 +893,62 @@ export default function Home() {
     }
   }
 
-  async function retryFailedImports() {
-    if (!beginOperation("retry-failed-imports")) return;
+  async function batchRemovePreviewItems(itemIds: number[]) {
+    if (!itemIds.length || activeOperationRef.current) return;
+    if (!window.confirm(`确认删除选中的 ${itemIds.length} 条预检结果？已加入知识库的作品不会被删除。`)) return;
+    if (!beginOperation("batch-remove-preview")) return;
     try {
-      const result = await api.retryFailedImports();
-      setNotice(result.message);
-      if (result.job_id) await loadJobs();
+      await api.deleteImportItems(itemIds);
+      setSelectedItems((current) => {
+        const next = new Set(current);
+        itemIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      setItemCollections((current) => {
+        const next = new Map(current);
+        itemIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      const candidates = [...retainedBatches, ...(batch ? [batch] : [])];
+      const settled = await Promise.allSettled(candidates.map((entry) => api.importBatch(entry.id)));
+      const refreshed = candidates.map((entry, index) =>
+        settled[index].status === "fulfilled" ? (settled[index].value as ImportBatch) : entry,
+      );
+      setBatch(batch ? refreshed.find((entry) => entry.id === batch.id) || null : null);
+      setRetainedBatches(
+        refreshed
+          .filter((entry) => entry.id !== batch?.id)
+          .map((entry) => ({
+            ...entry,
+            items: entry.items.filter((item) => RETAINED_IMPORT_STATUSES.has(item.status)),
+          }))
+          .filter((entry) => entry.items.length),
+      );
+      setNotice(`已删除 ${itemIds.length} 条预检结果`);
     } catch (value) {
-      setError(reason(value, "重试失败导入失败"));
+      setError(reason(value, "批量删除预检结果失败"));
+      await refreshSharedState();
     } finally {
-      endOperation("retry-failed-imports");
+      endOperation("batch-remove-preview");
+    }
+  }
+
+  async function batchRetryPreviewItems(itemIds: number[]) {
+    if (!itemIds.length || activeOperationRef.current) return;
+    if (!beginOperation("batch-retry-preview")) return;
+    try {
+      await api.retryImportItems(itemIds);
+      setNotice(`已将 ${itemIds.length} 条预检结果重新排入解析队列`);
+      setSelectedItems((current) => {
+        const next = new Set(current);
+        itemIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      await refreshSharedState();
+    } catch (value) {
+      setError(reason(value, "批量重试预检结果失败"));
+    } finally {
+      endOperation("batch-retry-preview");
     }
   }
 
@@ -1170,7 +1224,8 @@ export default function Home() {
           onConfirm={confirmBatch}
           onDelete={removePreviewItem}
           onEdit={editPreviewItem}
-          onRetryFailedImports={retryFailedImports}
+          onBatchDelete={batchRemovePreviewItems}
+          onBatchRetry={batchRetryPreviewItems}
           settings={settings}
           collections={collections}
         />

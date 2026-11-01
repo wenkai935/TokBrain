@@ -94,8 +94,6 @@ export type {
   ImportItem,
   ImportItemUpdate,
   ImportItemUpdateResult,
-  IntegrationTokenCreated,
-  IntegrationTokenStatus,
   Job,
   LibrarySummary,
   LocalImportBatchRequest,
@@ -521,16 +519,21 @@ class LocalApiClient {
     return this.request<unknown>(`/api/import-items/${itemId}`, { method: "DELETE" }).then(parseImportBatch);
   }
 
-  integrationToken(): Promise<Contract.IntegrationTokenStatus> {
-    return this.request("/api/settings/integration-token");
+  async deleteImportItems(itemIds: number[]): Promise<void> {
+    for (const id of itemIds) {
+      try {
+        await this.removeImportItem(id);
+      } catch {
+        // 单条删除失败不影响其余条目
+      }
+    }
   }
 
-  createIntegrationToken(): Promise<Contract.IntegrationTokenCreated> {
-    return this.request("/api/settings/integration-token", { method: "POST" });
-  }
-
-  revokeIntegrationToken(): Promise<Contract.IntegrationTokenStatus> {
-    return this.request("/api/settings/integration-token", { method: "DELETE" });
+  retryImportItems(itemIds: number[]): Promise<void> {
+    return this.request("/api/import-items/retry", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds }),
+    });
   }
 
   jobs(): Promise<Contract.Job[]> {
@@ -545,6 +548,10 @@ class LocalApiClient {
 
   retryFailedImports(): Promise<{ job_id: string | null; retried: number; message: string }> {
     return this.request("/api/jobs/retry", { method: "POST" });
+  }
+
+  clearCompletedJobs(): Promise<{ deleted: number }> {
+    return this.request("/api/jobs/completed", { method: "DELETE" });
   }
 
   collections(): Promise<{

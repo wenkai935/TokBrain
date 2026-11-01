@@ -237,17 +237,19 @@ POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "600"))  # 单任务最多等 
 POLL_CYCLE = int(os.environ.get("POLL_CYCLE", "60"))
 # 命令行传 --watch 进入常驻轮询模式
 WATCH_MODE = "--watch" in sys.argv
+CLI_DOWNLOAD = "--download" in sys.argv
+CLI_AUTO_CONFIRM = "--auto-confirm" in sys.argv
 
 # 是否放弃抖音解析（默认开启）：抖音风控(429)会熔断 30min，飞书同步不再把链接
 # 丢给平台解析，改为「长链确认 + 元数据 Work 入库」，Obsidian 笔记保留链接；
 # 后续可在 TokBrain 网页为对应 work 补件。设 0 可回退到原解析路径。
-FS_NO_DOUYIN = os.environ.get("FS_NO_DOUYIN", "1") != "0"
+FS_NO_DOUYIN = False if CLI_DOWNLOAD else os.environ.get("FS_NO_DOUYIN", "1") != "0"
 
 # 预检完成后是否直接 confirm + ingest 到底。
 #   默认 0（停下等确认）：链接先由 f2 补上标题/作者/封面，回写飞书记「待确认」，
 #   等人或 agent 说「解析吧」再入库。设计意图：手机随手存的链接不该自动烧额度。
 #   设 1 回到旧行为：预检完直接确认并送入库队列，一路跑到作品出来。
-FS_AUTO_CONFIRM = os.environ.get("FS_AUTO_CONFIRM", "0") == "1"
+FS_AUTO_CONFIRM = CLI_AUTO_CONFIRM or os.environ.get("FS_AUTO_CONFIRM", "0") == "1"
 
 # 是否在导出笔记时，把该作品的关键帧图片也拷进 Vault 并嵌入（默认开启）。
 # 注意：官方 obsidian/manifest 默认不带关键帧(asset_ids 为空)，
@@ -1109,6 +1111,25 @@ def _sync_obsidian_title(note_path: str, title: str) -> None:
         print(f"  [warn] 同步 title 到 Obsidian 失败 {p.name}: {e}")
 
 
+def _rename_note_to_concept(note_path: Path, filename: str, work_id) -> Path:
+    """用 manifest 的核心概念改名，并保留同目录下的唯一性。"""
+    stem = Path(str(filename or "")).stem
+    stem = re.sub(r"__[^_]+-[^_]+$", "", stem).strip()
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" ._") or f"未命名作品-{work_id}"
+    target = note_path.with_name(f"{stem}.md")
+    if target == note_path:
+        return note_path
+    if target.exists():
+        target = note_path.with_name(f"{stem}__{work_id}.md")
+    try:
+        note_path.replace(target)
+        return target
+    except OSError as e:
+        print(f"  [warn] 核心概念改名失败 {note_path.name}: {e}")
+        return note_path
+
+
 def _backfill_note_metadata_only(work_id, item) -> Path:
     """仅链接入库（无媒体）的轻量回填：不动媒体 manifest，只更新 frontmatter。
 
@@ -1145,6 +1166,10 @@ def _backfill_note_metadata_only(work_id, item) -> Path:
     if hint.strip() not in md:
         md = md.rstrip() + "\n" + hint
     note_path.write_text(md, encoding="utf-8")
+    meta_title = _work_meta(work_id).get("title")
+    if meta_title:
+        note_path = _rename_note_to_concept(note_path, meta_title, work_id)
+    item["note_path"] = str(note_path)
     return note_path
 
 
@@ -1190,6 +1215,8 @@ def backfill_note(tb: TokBrain, work_id, item) -> Path:
         _fields["platform_work_id"] = meta["platform_work_id"]
     md = merge_frontmatter(md, _fields)
     note_path.write_text(md, encoding="utf-8")
+    note_path = _rename_note_to_concept(note_path, it.get("filename"), work_id)
+    item["note_path"] = str(note_path)
     return note_path
 
 
@@ -1496,13 +1523,14 @@ def _work_meta(work_id):
         con = _sql.connect(str(TOKBRAIN_DB))
         con.row_factory = _sql.Row
         row = con.execute(
-            "SELECT platform, author_name, platform_work_id FROM works WHERE id=?",
+            "SELECT title, platform, author_name, platform_work_id FROM works WHERE id=?",
             (work_id,),
         ).fetchone()
         con.close()
         if not row:
             return {}
         return {
+            "title": (row["title"] or "").strip(),
             "platform": (row["platform"] or "").strip(),
             "author_name": (row["author_name"] or "").strip(),
             "platform_work_id": (row["platform_work_id"] or "").strip(),
@@ -1538,8 +1566,9 @@ def rescan_supplements(tb: TokBrain, store: DispatchStore) -> int:
         if work_processing_state(work_id) != "processed":
             continue
         try:
-            backfill_note(tb, work_id, item)
-            store.update(rid, status="processed", error_code="", error_message="")
+            note_path = backfill_note(tb, work_id, item)
+            store.update(rid, status="processed", work_id=work_id,
+                         note_path=str(note_path), error_code="", error_message="")
             mark_note_status(item, "processed")
             print(f"[rescan] {rid} 补件完成（work {work_id} 已 processed），已回填并推进")
             resumed += 1
@@ -1586,9 +1615,10 @@ def resume_ingested(tb: TokBrain, store: DispatchStore) -> int:
                         tb.add_works_to_collection(collection_id, [work_id])
                 except Exception as e:
                     print(f"  [warn] 补挂收藏夹失败（不影响回填）: {e}")
-            backfill_note(tb, work_id, item)
+            note_path = backfill_note(tb, work_id, item)
             store.update(
-                rid, status="processed", work_id=work_id, error_code="", error_message=""
+                rid, status="processed", work_id=work_id, note_path=str(note_path),
+                error_code="", error_message=""
             )
             print(f"[ingest] {rid} 已回填（work {work_id}），推进 processed")
             done += 1
@@ -1620,8 +1650,9 @@ def process_queue(tb: TokBrain, store: DispatchStore) -> None:
             else:
                 work_ids = process_link(tb, link, item["tags"])
             store.update(rid, status="processing", work_id=work_ids[0] if work_ids else None)
-            backfill_note(tb, work_ids[0], item)
-            store.update(rid, status="processed", error_code="", error_message="")
+            note_path = backfill_note(tb, work_ids[0], item)
+            store.update(rid, status="processed", work_id=work_ids[0],
+                         note_path=str(note_path), error_code="", error_message="")
             print(f"[ok] {link or local_path} -> 已回填")
         except NeedsSupplement as e:
             store.update(rid, status="needs_supplement", error_code="needs_supplement",

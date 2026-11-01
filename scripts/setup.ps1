@@ -296,6 +296,23 @@ try {
         "-m", "pip", "install", "-r", (Join-Path $WorkspacePath "requirements.txt")
     ) -FailureMessage "安装 Python 主依赖失败，请检查网络连接后重试。"
 
+    # 下载板块（tools/douyin_bridge/bridge_douyin.py）的可选依赖：playwright + yt-dlp。
+    # 核心服务不依赖它，故浏览器内核下载失败仅警告、不中断主安装流程。
+    if (Test-Path -LiteralPath (Join-Path $WorkspacePath "requirements-download.txt")) {
+        Invoke-NativeStep -FilePath $NewVenvPython -Arguments @(
+            "-m", "pip", "install", "-r",
+            (Join-Path $WorkspacePath "requirements-download.txt")
+        ) -FailureMessage "安装下载板块依赖（playwright/yt-dlp）失败，请检查网络后重试。"
+        Write-Host "正在拉取 Playwright Chromium 浏览器内核（可选，失败不影响核心服务）..." -ForegroundColor DarkGray
+        & $NewVenvPython -m playwright install chromium 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning (
+                "Chromium 浏览器内核下载失败，下载板块暂不可用；" +
+                "可稍后在 .venv 中手动执行：python -m playwright install chromium"
+            )
+        }
+    }
+
     if (-not $WithoutBilling) {
         Invoke-NativeStep -FilePath $NewVenvPython -Arguments @(
             "-m", "pip", "install", "-r",

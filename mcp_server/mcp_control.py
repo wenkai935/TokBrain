@@ -705,12 +705,14 @@ async def tb_sync_replay(
     limit: int = 5,
     newest_first: bool = False,
     record_ids: list[str] | None = None,
+    include_processed: bool = False,
 ) -> str:
     return await _call(
         commands.sync_replay,
         limit=limit,
         newest_first=newest_first,
         record_ids=record_ids,
+        include_processed=include_processed,
     )
 
 

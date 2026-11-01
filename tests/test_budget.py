@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.services.budget as budget
-from app.models import Base, DailyBudget, UsageEvent
+import app.services.jobs as jobs
+from app.models import Base, DailyBudget, Job, UsageEvent, Work
 from app.services.providers import ProviderUsage
 
 
@@ -171,4 +172,99 @@ async def test_unknown_model_usage_is_explicitly_unpriced(tmp_path):
         assert event.metadata_json["price_status"] == "unpriced"
         assert event.metadata_json["unpriced"] is True
 
+    await engine.dispose()
+
+
+async def test_budget_deferred_works_resume_when_the_quota_day_rolls_over(tmp_path):
+    """A quota deferral must not outlive the day whose quota produced it.
+
+    The daily counter is keyed by the Shanghai date, so yesterday's exhausted
+    quota says nothing about today. The sweep re-queues the deferred works and
+    the enqueue clears their stale "已达到今日音视频分钟上限" stamp, which is what
+    the UI was still showing days later.
+    """
+
+    engine, factory = await budget_factory(tmp_path)
+    async with factory() as session:
+        for platform_work_id, state in (
+            ("deferred-pending", "pending"),
+            ("deferred-issues", "issues"),
+        ):
+            session.add(
+                Work(
+                    platform_work_id=platform_work_id,
+                    title=platform_work_id,
+                    library_state=state,
+                    processing_state="discovered",
+                    last_error_code="budget_deferred",
+                    process_error="已达到今日音视频分钟上限",
+                )
+            )
+        session.add(
+            Work(
+                platform_work_id="healthy",
+                title="healthy",
+                library_state="pending",
+                processing_state="discovered",
+            )
+        )
+        await session.commit()
+
+    async with factory() as session:
+        resumed = await jobs.resume_budget_deferred_works(session)
+        await session.commit()
+        assert len(resumed) == 2
+        works = {
+            work.platform_work_id: work
+            for work in (await session.execute(select(Work))).scalars()
+        }
+        assert works["deferred-pending"].last_error_code is None
+        assert works["deferred-pending"].process_error is None
+        assert works["deferred-issues"].last_error_code is None
+        assert works["deferred-issues"].process_error is None
+        assert works["healthy"].last_error_code is None
+        queued = (await session.execute(select(Job))).scalars().all()
+        assert len(queued) == 1
+        assert queued[0].job_type == "ingest"
+        assert queued[0].state == "queued"
+        assert sorted(queued[0].scope["work_ids"]) == sorted(resumed)
+
+    # The stamps are gone, so a second sweep on the same day has nothing to do.
+    async with factory() as session:
+        assert await jobs.resume_budget_deferred_works(session) == []
+    await engine.dispose()
+
+
+async def test_resume_skips_deferred_works_owned_by_an_active_job(tmp_path):
+    engine, factory = await budget_factory(tmp_path)
+    async with factory() as session:
+        session.add(
+            Work(
+                platform_work_id="deferred-active",
+                title="deferred-active",
+                library_state="pending",
+                processing_state="discovered",
+                last_error_code="budget_deferred",
+                process_error="已达到今日音视频分钟上限",
+            )
+        )
+        await session.commit()
+        work_id = await session.scalar(
+            select(Work.id).where(Work.platform_work_id == "deferred-active")
+        )
+        session.add(
+            Job(
+                id="active-job",
+                job_type="ingest",
+                state="running",
+                scope={"work_ids": [work_id]},
+            )
+        )
+        await session.commit()
+
+    async with factory() as session:
+        assert await jobs.resume_budget_deferred_works(session) == []
+        work = await session.scalar(select(Work))
+        assert work is not None
+        assert work.last_error_code == "budget_deferred"
     await engine.dispose()

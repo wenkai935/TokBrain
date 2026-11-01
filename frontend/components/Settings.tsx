@@ -1,12 +1,11 @@
 "use client";
 
-import type { CSSProperties, FormEvent } from "react";
-import { useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
+import { useEffect, useState } from "react";
 
 import { api } from "../lib/api";
 import type {
   Health,
-  IntegrationTokenStatus,
   ModelProfile,
   ModelProfilePayload,
   ModelProfilesView,
@@ -60,7 +59,7 @@ function themePreviewStyle(theme: ThemeDefinition) {
     "--preview-surface": theme.preview[1],
     "--preview-accent": theme.preview[2],
     "--preview-text": theme.preview[3],
-  } as CSSProperties;
+  } as React.CSSProperties;
 }
 
 const HEALTH_PROBE_NAMES = ["database", "media_runtime", "coordinators", "security_cleanup"] as const;
@@ -151,7 +150,7 @@ function profileToDraft(profile: ModelProfile | null): ProfileDraft {
   };
 }
 
-function ModelProfileManager({ perform }: { perform: PerformOperation }) {
+function ModelProfileManager({ perform, children }: { perform: PerformOperation; children?: React.ReactNode }) {
   const [view, setView] = useState<ModelProfilesView | null>(null);
   const [loadError, setLoadError] = useState("");
   const [draft, setDraft] = useState<ProfileDraft | null>(null);
@@ -198,29 +197,6 @@ function ModelProfileManager({ perform }: { perform: PerformOperation }) {
     setEditingId(null);
   }
 
-  function startEdit(profile: ModelProfile) {
-    setEditorError("");
-    setDraft(profileToDraft(profile));
-    setEditingId(profile.id);
-  }
-
-  function activateProfile(profile: ModelProfile) {
-    void runProfileOp(
-      `mp-activate-${profile.id}`,
-      () => api.activateModelProfile(profile.id).then((result) => { setView(result); return result; }),
-      `已切换生效配置：「${profile.name}」`,
-    );
-  }
-
-  function deleteProfile(profile: ModelProfile) {
-    if (!window.confirm(`删除配置「${profile.name}」？其独立保存的 API Key 也会一并清除，删除后无法恢复。`)) return;
-    void runProfileOp(
-      `mp-delete-${profile.id}`,
-      () => api.deleteModelProfile(profile.id).then((result) => { setView(result); return result; }),
-      `已删除配置「${profile.name}」`,
-    );
-  }
-
   async function saveEditor() {
     if (!draft) return;
     const name = draft.name.trim();
@@ -253,20 +229,47 @@ function ModelProfileManager({ perform }: { perform: PerformOperation }) {
   const rows = view
     ? [view.default_profile, ...view.items]
     : [];
+
   const activeRow = view
     ? rows.find((profile) => profile.id === view.active_id) || view.default_profile
     : null;
 
   return (
-    <section className="card model-profiles-card">
-      <div className="section-head">
-        <div><span className="kicker">模型与供应商</span><h2>多模型配置</h2></div>
-        <span className={`pill ${activeRow ? "succeeded" : "cancelled"}`}>
-          {view == null ? "读取中" : `生效：${activeRow ? activeRow.name : "内置默认"}`}
-        </span>
-      </div>
-      <p className="muted">可保存多套供应商与模型组合并随时切换。媒体解析链（OCR/ASR/画面/总结）仅支持百炼型配置；密钥经 DPAPI 加密只保存在本机后台，页面不显示明文。</p>
+    <div className="model-profiles-card">
       {loadError && <p className="profile-error">{loadError}</p>}
+
+      {view && activeRow && (
+        <div className="profile-row active current-profile">
+          <div className="profile-main">
+            <div className="profile-title">
+              <strong>{activeRow.name}</strong>
+              <span className="pill succeeded">生效中</span>
+            </div>
+            <div className="profile-meta">
+              {PROVIDER_LABELS[activeRow.provider_type] || activeRow.provider_type}
+              {activeRow.base_url ? ` · ${activeRow.base_url}` : ""}
+            </div>
+            <div className="profile-models" aria-label="当前生效配置使用的模型">
+              <span>画面 {activeRow.ocr_model || "—"}</span>
+              <span>语音 {activeRow.asr_model || "—"}</span>
+              <span>向量 {activeRow.embedding_model || "—"}</span>
+              <span>总结 {activeRow.enrichment_model || "—"}</span>
+              <span>对话 {activeRow.chat_model || "—"}</span>
+              <span>重排 {activeRow.rerank_model || "—"}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {children}
+
+      <div className="subhead standalone"><span>新增模型</span></div>
+      <p className="muted">可保存多套供应商与模型组合并随时切换。媒体解析链（OCR/ASR/画面/总结）仅支持百炼型配置；密钥经 DPAPI 加密只保存在本机后台，页面不显示明文。</p>
+      <div className="button-row profile-add">
+        <button type="button" className="secondary" disabled={busyKey !== "" || draft !== null} onClick={openCreate}>
+          + 新增一套供应商配置
+        </button>
+      </div>
 
       {draft && (
         <form className="profile-editor" onSubmit={(event) => { event.preventDefault(); void saveEditor(); }}>
@@ -328,64 +331,7 @@ function ModelProfileManager({ perform }: { perform: PerformOperation }) {
           {editorError && <p className="profile-error">{editorError}</p>}
         </form>
       )}
-
-      {view && (
-        <>
-          <div className="profile-list">
-            {rows.map((profile) => (
-              <div className={`profile-row ${profile.is_active ? "active" : ""}`} key={profile.id}>
-                <div className="profile-main">
-                  <div className="profile-title">
-                    <strong>{profile.name}</strong>
-                    {profile.is_active && <span className="pill succeeded">生效中</span>}
-                    {profile.builtin && !profile.is_active && <span className="pill cancelled">内置默认</span>}
-                    {!profile.builtin && profile.has_api_key && <span className="pill succeeded">已存密钥</span>}
-                    {!profile.builtin && !profile.has_api_key && <span className="pill cancelled">未存密钥</span>}
-                  </div>
-                  <div className="profile-meta">
-                    {PROVIDER_LABELS[profile.provider_type] || profile.provider_type}
-                    {profile.base_url ? ` · ${profile.base_url}` : profile.provider_type === "openai" ? " · 默认接入点" : ""}
-                  </div>
-                  <div className="profile-models" aria-label="各处理角色使用的模型">
-                    <span>画面 {profile.ocr_model || "—"}</span>
-                    <span>语音 {profile.asr_model || "—"}</span>
-                    <span>向量 {profile.embedding_model || "—"}</span>
-                    <span>总结 {profile.enrichment_model || "—"}</span>
-                    <span>对话 {profile.chat_model || "—"}</span>
-                    <span>重排 {profile.rerank_model || "—"}</span>
-                  </div>
-                </div>
-                <div className="profile-actions">
-                  {!profile.is_active && (
-                    <button type="button" className="secondary" disabled={busyKey !== ""}
-                      onClick={() => activateProfile(profile)}>
-                      启用
-                    </button>
-                  )}
-                  {!profile.builtin && (
-                    <button type="button" className="link" disabled={busyKey !== ""}
-                      onClick={() => startEdit(profile)}>
-                      编辑
-                    </button>
-                  )}
-                  {!profile.builtin && (
-                    <button type="button" className="danger profile-delete" disabled={busyKey !== ""}
-                      onClick={() => deleteProfile(profile)}>
-                      删除
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-          <div className="button-row profile-add">
-            <button type="button" className="secondary" disabled={busyKey !== "" || draft !== null} onClick={openCreate}>
-              + 新增一套供应商配置
-            </button>
-          </div>
-        </>
-      )}
-    </section>
+    </div>
   );
 }
 
@@ -407,24 +353,9 @@ export function Settings({
   const [checking, setChecking] = useState(false);
   const [checkProgress, setCheckProgress] = useState(health ? 100 : 0);
   const [liveProbes, setLiveProbes] = useState<Health["probes"]>(health?.probes || []);
-  const [f2CookieDraft, setF2CookieDraft] = useState("");
   const [billingAccessKeyIdDraft, setBillingAccessKeyIdDraft] = useState("");
   const [billingAccessKeySecretDraft, setBillingAccessKeySecretDraft] = useState("");
-  const [summaryPromptDraft, setSummaryPromptDraft] = useState(settings.summary_prompt);
-  const [integrationToken, setIntegrationToken] = useState<IntegrationTokenStatus | null>(null);
-  const [revealedIntegrationToken, setRevealedIntegrationToken] = useState("");
-  const [integrationTokenBusy, setIntegrationTokenBusy] = useState(false);
-  const [integrationTokenMessage, setIntegrationTokenMessage] = useState("");
-  const [integrationTokenError, setIntegrationTokenError] = useState("");
-  const dashscopeApiKeyRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    let active = true;
-    api.integrationToken()
-      .then((status) => { if (active) setIntegrationToken(status); })
-      .catch((value) => { if (active) setIntegrationTokenError(reason(value, "读取外部导入令牌状态失败")); });
-    return () => { active = false; };
-  }, []);
+  const [dashscopeApiKeyDraft, setDashscopeApiKeyDraft] = useState("");
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -432,20 +363,24 @@ export function Settings({
     const numeric = ["daily_media_minutes_limit", "daily_llm_token_limit", "monthly_warning_cny", "scene_threshold", "max_scene_candidates", "max_keyframes", "min_keyframe_gap_seconds"] as const;
     const body: RuntimeSettingsUpdate = {};
     numeric.forEach((name) => body[name] = Number(form.get(name)));
-    (["dashscope_api_key", "bss_access_key_id", "bss_access_key_secret"] as const).forEach((name) => { const value = String(form.get(name) || "").trim(); if (value) body[name] = value; });
-    (["processing_model", "chat_fast_model", "chat_deep_model", "default_answer_format"] as const).forEach((name) => {
-      body[name] = String(form.get(name) || "");
-    });
-    const clearF2Cookie = form.get("clear_f2_cookie") === "on";
-    body.clear_f2_cookie = clearF2Cookie;
-    body.summary_prompt = summaryPromptDraft.trim() || settings.default_summary_prompt;
-    const saved = await perform("settings", () => api.saveSettings(body), "设置已保存");
-    if (saved) {
-      if (dashscopeApiKeyRef.current) dashscopeApiKeyRef.current.value = "";
-      if (clearF2Cookie) setF2CookieDraft("");
-      setBillingAccessKeyIdDraft("");
-      setBillingAccessKeySecretDraft("");
-    }
+    body.processing_model = String(form.get("processing_model") || "");
+    await perform("settings", () => api.saveSettings(body), "设置已保存");
+  }
+
+  async function saveParseSettings() {
+    const form = new FormData(document.querySelector<HTMLFormElement>("form.stack")!);
+    const names = ["scene_threshold", "max_scene_candidates", "max_keyframes", "min_keyframe_gap_seconds"] as const;
+    const body: RuntimeSettingsUpdate = {};
+    names.forEach((name) => { body[name] = Number(form.get(name)); });
+    await perform("parse-settings", () => api.saveSettings(body), "解析设置已保存");
+  }
+
+  async function saveFeeSettings() {
+    const form = new FormData(document.querySelector<HTMLFormElement>("form.stack")!);
+    const names = ["daily_media_minutes_limit", "monthly_warning_cny", "daily_llm_token_limit"] as const;
+    const body: RuntimeSettingsUpdate = {};
+    names.forEach((name) => { body[name] = Number(form.get(name)); });
+    await perform("fee-settings", () => api.saveSettings(body), "费用设置已保存");
   }
 
   async function runHealthDetection() {
@@ -472,15 +407,15 @@ export function Settings({
     setChecking(false);
   }
 
-  async function saveF2Cookie() {
-    const value = f2CookieDraft.trim();
+  async function saveDashscopeKey() {
+    const value = dashscopeApiKeyDraft.trim();
     if (!value) return;
     const saved = await perform(
-      "f2-cookie",
-      () => api.saveSettings({ f2_cookie: value, clear_f2_cookie: false }),
-      "解析 Cookie 已加密保存，可以返回导入页重新预检",
+      "dashscope-key",
+      () => api.saveSettings({ dashscope_api_key: value }),
+      "百炼模型 API Key 已在本机后台加密保存",
     );
-    if (saved) setF2CookieDraft("");
+    if (saved) setDashscopeApiKeyDraft("");
   }
 
   async function saveBillingCredentials() {
@@ -512,76 +447,9 @@ export function Settings({
       "全部模型 API Key 与账单 AccessKey 已删除",
     );
     if (cleared) {
-      if (dashscopeApiKeyRef.current) dashscopeApiKeyRef.current.value = "";
+      setDashscopeApiKeyDraft("");
       setBillingAccessKeyIdDraft("");
       setBillingAccessKeySecretDraft("");
-    }
-  }
-
-  async function saveSummaryPrompt(value = summaryPromptDraft) {
-    const prompt = value.trim();
-    if (!prompt) return;
-    await perform(
-      "summary-prompt",
-      () => api.saveSettings({ summary_prompt: prompt }),
-      "AI 总结提示词已保存，之后创建的总结任务将使用此内容",
-    );
-  }
-
-  async function resetSummaryPrompt() {
-    setSummaryPromptDraft(settings.default_summary_prompt);
-    await saveSummaryPrompt(settings.default_summary_prompt);
-  }
-
-  async function createIntegrationToken() {
-    if (
-      integrationToken?.configured
-      && !window.confirm("轮换令牌会立即使旧令牌失效。确认继续吗？")
-    ) return;
-    setIntegrationTokenBusy(true);
-    setIntegrationTokenError("");
-    setIntegrationTokenMessage("");
-    try {
-      const created = await api.createIntegrationToken();
-      setIntegrationToken({
-        configured: created.configured,
-        prefix: created.prefix,
-        created_at: created.created_at,
-      });
-      setRevealedIntegrationToken(created.token);
-      setIntegrationTokenMessage("新令牌已生成。请立即复制，关闭或离开本页后无法再次查看明文。");
-    } catch (value) {
-      setIntegrationTokenError(reason(value, "生成外部导入令牌失败"));
-    } finally {
-      setIntegrationTokenBusy(false);
-    }
-  }
-
-  async function copyIntegrationToken() {
-    if (!revealedIntegrationToken) return;
-    try {
-      await navigator.clipboard.writeText(revealedIntegrationToken);
-      setIntegrationTokenMessage("令牌已复制到剪贴板，请保存到调用工具的安全配置中。");
-      setIntegrationTokenError("");
-    } catch {
-      setIntegrationTokenError("自动复制失败，请选中令牌后手动复制。");
-    }
-  }
-
-  async function revokeIntegrationToken() {
-    if (!window.confirm("撤销后，所有使用当前令牌的外部导入工具都会立即失效。确认撤销吗？")) return;
-    setIntegrationTokenBusy(true);
-    setIntegrationTokenError("");
-    setIntegrationTokenMessage("");
-    try {
-      const status = await api.revokeIntegrationToken();
-      setIntegrationToken(status);
-      setRevealedIntegrationToken("");
-      setIntegrationTokenMessage("外部导入令牌已撤销。");
-    } catch (value) {
-      setIntegrationTokenError(reason(value, "撤销外部导入令牌失败"));
-    } finally {
-      setIntegrationTokenBusy(false);
     }
   }
 
@@ -628,18 +496,19 @@ export function Settings({
           </div>
         </section>
         <CookieVault />
-        <section className="card">
-          <div className="section-head"><div><span className="kicker">处理额度</span><h2>媒体、AI 与费用</h2></div></div>
+        <section className="card model-config-card">
+          <div className="section-head">
+            <div><span className="kicker">模型配置</span><h2>模型与对话</h2></div>
+          </div>
+          <div className="subhead standalone"><span>当前模型</span></div>
+          <ModelProfileManager perform={perform}>
           <div className="form-grid">
-            <Field name="daily_media_minutes_limit" label="每日媒体分钟" value={settings.daily_media_minutes_limit} min={1} />
-            <Field name="daily_llm_token_limit" label="每日 AI Token" value={settings.daily_llm_token_limit} min={1000} />
-            <Field name="monthly_warning_cny" label="月度费用预警" value={settings.monthly_warning_cny} min={0} step=".01" />
-            <Field name="scene_threshold" label="画面变化灵敏度" value={settings.scene_threshold} min={0.05} max={0.95} step=".05" />
-            <Field name="max_scene_candidates" label="初选画面上限" value={settings.max_scene_candidates} min={12} max={1000} />
-            <Field name="max_keyframes" label="最终保留画面" value={settings.max_keyframes} min={1} max={48} />
-            <Field name="min_keyframe_gap_seconds" label="画面最小间隔" value={settings.min_keyframe_gap_seconds} min={0.2} max={60} step=".1" />
+            <div className="field model-readonly">
+              <span>语音转写模型</span>
+              <p>{settings.asr_model}（百炼）</p>
+            </div>
             <label className="field">
-              <span>视频/图文总结模型</span>
+              <span>视频图文总结模型</span>
               <select name="processing_model" defaultValue={settings.processing_model}>
                 {settings.processing_model_options.map((model) => (
                   <option key={model} value={model}>{modelOptionLabel(model)}</option>
@@ -647,85 +516,27 @@ export function Settings({
               </select>
               <small>仅列出支持 JSON 结构化总结的文本生成模型；向量、重排、语音模型不能用于这里。</small>
             </label>
-            <div className="field model-readonly">
-              <span>固定专用模型</span>
-              <p>画面识别：{settings.ocr_model}<br />语音转写：{settings.asr_model}<br />向量检索：{settings.embedding_model}</p>
-            </div>
-            <label className="field">
-              <span>快速对话模型</span>
-              <select name="chat_fast_model" defaultValue={settings.chat_fast_model}>
-                {settings.chat_model_options.map((model) => (
-                  <option key={model} value={model}>{modelOptionLabel(model)}</option>
-                ))}
-              </select>
-              <small>日常问答优先使用的轻量模型，响应更快、成本更低。</small>
-            </label>
-            <label className="field">
-              <span>深度对话模型</span>
-              <select name="chat_deep_model" defaultValue={settings.chat_deep_model}>
-                {settings.chat_model_options.map((model) => (
-                  <option key={model} value={model}>{modelOptionLabel(model)}</option>
-                ))}
-              </select>
-              <small>复杂分析或长上下文问题时切换使用的高能力模型。</small>
-            </label>
-            <label className="field">
-              <span>默认回答格式</span>
-              <select name="default_answer_format" defaultValue={settings.default_answer_format}>
-                <option value="rich">图文混排（rich）</option>
-                <option value="markdown">Markdown</option>
-                <option value="plain">纯文本</option>
-              </select>
-              <small>新建对话的默认回答排版方式，单次对话内仍可随时切换。</small>
-            </label>
-            <div className="field wide summary-prompt-field">
-              <span>视频 AI 总结提示词</span>
-              <textarea
-                name="summary_prompt"
-                rows={18}
-                maxLength={12000}
-                value={summaryPromptDraft}
-                onChange={(event) => setSummaryPromptDraft(event.target.value)}
-                placeholder="用于控制视频和图文入库后的 AI 总结方式"
-              />
-              <div className="prompt-field-actions">
-                <small>{summaryPromptDraft.length.toLocaleString()} / 12,000 字符；修改只影响之后新建或重新生成的总结</small>
-                <div className="button-row">
-                  <button type="button" className="link" disabled={busy === "summary-prompt"} onClick={resetSummaryPrompt}>一键恢复默认提示词</button>
-                  <button type="button" className="secondary" disabled={!summaryPromptDraft.trim() || busy === "summary-prompt"} onClick={() => saveSummaryPrompt()}>
-                    {busy === "summary-prompt" ? "保存中…" : "保存提示词"}
-                  </button>
-                </div>
-              </div>
-            </div>
-            <label className="field wide"><span>百炼模型密钥 {settings.has_dashscope_key && "（已保存，留空不修改）"}</span><input ref={dashscopeApiKeyRef} name="dashscope_api_key" type="password" autoComplete="new-password" /></label>
-            <div className="field wide cookie-field">
-              <span>解析 Cookie 粘贴保存 {settings.has_f2_cookie && "（已保存并生效）"}</span>
-              <textarea
-                rows={3}
-                maxLength={20000}
-                autoComplete="off"
-                value={f2CookieDraft}
-                onChange={(event) => setF2CookieDraft(event.target.value)}
-                placeholder="没有 cookies.txt 文件时可临时粘贴；保存后会同步写入统一 Cookie 库的 douyin.txt"
-              />
-              <div className="cookie-field-actions">
-                <small>
-                  {settings.has_f2_cookie
-                    ? "已保存；重新粘贴可覆盖。下载器与 F2 读的是同一份 douyin.txt"
-                    : "尚未保存；上传 cookies.txt 是更省事的方式（见上方 Cookie 上传）"}
-                </small>
+            <label className="field wide inline-action">
+              <span>百炼模型 API Key {settings.has_dashscope_key && "（已加密保存）"}</span>
+              <div className="input-with-button">
+                <input
+                  name="dashscope_api_key"
+                  type="password"
+                  autoComplete="new-password"
+                  value={dashscopeApiKeyDraft}
+                  onChange={(event) => setDashscopeApiKeyDraft(event.target.value)}
+                  placeholder={settings.has_dashscope_key ? "已加密保存，无需重新输入" : "请输入百炼 API Key"}
+                />
                 <button
                   type="button"
                   className="secondary"
-                  disabled={!f2CookieDraft.trim() || busy === "f2-cookie"}
-                  onClick={saveF2Cookie}
+                  disabled={!dashscopeApiKeyDraft.trim() || busy === "dashscope-key"}
+                  onClick={saveDashscopeKey}
                 >
-                  {busy === "f2-cookie" ? "保存中…" : "保存 Cookie"}
+                  {busy === "dashscope-key" ? "保存中…" : "保存"}
                 </button>
               </div>
-            </div>
-            {settings.has_f2_cookie && <label className="field checkbox-field"><span>清除已保存的解析 Cookie（会一并删除 data/cookies/douyin.txt）</span><input name="clear_f2_cookie" type="checkbox" /></label>}
+            </label>
             <label className="field">
               <span>账单查询 AccessKey ID {settings.has_bss_credentials && "（后台已保存）"}</span>
               <input
@@ -749,8 +560,11 @@ export function Settings({
               />
             </label>
             <div className="field wide billing-credentials-status">
-              <span>账单凭据保存状态</span>
+              <span>账单查询状态</span>
               <div>
+                <span className={`pill ${settings.has_bss_credentials ? "succeeded" : "cancelled"}`}>
+                  {settings.has_bss_credentials ? "已加密保存" : "未配置"}
+                </span>
                 <small>
                   {settings.has_bss_credentials
                     ? "AccessKey ID 与 Secret 已保存在本机后台，退出页面或重启应用后仍然有效。为避免泄露，密码框不会显示原文。"
@@ -766,9 +580,42 @@ export function Settings({
                   }
                   onClick={saveBillingCredentials}
                 >
-                  {busy === "billing-credentials" ? "保存中…" : settings.has_bss_credentials ? "更新账单凭据" : "保存账单凭据"}
+                  {busy === "billing-credentials" ? "保存中…" : settings.has_bss_credentials ? "更新凭据" : "保存"}
                 </button>
               </div>
+            </div>
+          </div>
+          </ModelProfileManager>
+        </section>
+        <section className="card parse-fee-card">
+          <div className="section-head">
+            <div><span className="kicker">解析配置与费用</span><h2>解析与额度</h2></div>
+          </div>
+          <div className="form-grid">
+            <div className="subhead"><span>解析设置</span></div>
+            <Field name="max_scene_candidates" label="初选画面上限" value={settings.max_scene_candidates} min={12} max={1000} />
+            <Field name="scene_threshold" label="画面变化灵敏度" value={settings.scene_threshold} min={0.05} max={0.95} step=".05" />
+            <Field name="min_keyframe_gap_seconds" label="画面最小间隔" value={settings.min_keyframe_gap_seconds} min={0.2} max={60} step=".1" />
+            <Field name="max_keyframes" label="最终保留画面" value={settings.max_keyframes} min={1} max={48} />
+            <div className="button-row group-save">
+              <button type="button" className="primary" disabled={busy === "parse-settings"} onClick={saveParseSettings}>
+                {busy === "parse-settings" ? "保存中…" : "保存解析设置"}
+              </button>
+            </div>
+            <div className="subhead"><span>费用</span></div>
+            <Field name="daily_media_minutes_limit" label="每日解析媒体总时长" value={settings.daily_media_minutes_limit} min={1} />
+            <Field name="monthly_warning_cny" label="月度费用警戒线" value={settings.monthly_warning_cny} min={0} step=".01" />
+            <label className="field wide">
+              <span>每日调用 tokens</span>
+              <div className="field-control">
+                <input name="daily_llm_token_limit" type="number" defaultValue={settings.daily_llm_token_limit} min={1000} />
+                <small className="wan-hint">{formatWan(settings.daily_llm_token_limit)}（万进制）</small>
+              </div>
+            </label>
+            <div className="button-row group-save">
+              <button type="button" className="primary" disabled={busy === "fee-settings"} onClick={saveFeeSettings}>
+                {busy === "fee-settings" ? "保存中…" : "保存费用设置"}
+              </button>
             </div>
             <div className="field wide billing-summary">
               <span>本月账单</span>
@@ -800,7 +647,7 @@ export function Settings({
             <div className="field wide billing-refresh">
               <span>官方账单核对</span>
               <div>
-                <small>凭据保存后可直接刷新；官方数据通常有约 24 小时结算延迟，可能与本地实时估算不同。</small>
+                <small>先保存后可直接刷新；官方数据通常有约 24 小时结算延迟，可能与本地动态估算不同。</small>
                 <button
                   type="button"
                   className="secondary"
@@ -815,63 +662,6 @@ export function Settings({
           <p className="muted">{settings.dpapi_warning}</p>
           <p className="muted">今日公开链接 {usage?.daily_links_used || 0}/{usage?.daily_links_limit || 150} · 今日 AI {(usage?.daily_llm_tokens_used || 0).toLocaleString()}/{(usage?.daily_llm_tokens_limit || 0).toLocaleString()}</p>
         </section>
-        <ModelProfileManager perform={perform} />
-        <section className="card integration-token-card">
-          <div className="section-head">
-            <div>
-              <span className="kicker">同机外部工具</span>
-              <h2>外部批量导入令牌</h2>
-            </div>
-            <span className={`pill ${integrationToken?.configured ? "succeeded" : "cancelled"}`}>
-              {integrationToken == null ? "读取中" : integrationToken.configured ? "已启用" : "未配置"}
-            </span>
-          </div>
-          <p className="muted">
-            令牌仅用于本机 127.0.0.1 上的版本化批量导入接口。后台只保存哈希，明文仅在生成或轮换后显示一次。
-          </p>
-          {integrationToken?.configured && (
-            <div className="integration-token-status">
-              <span><small>令牌前缀</small><strong>{integrationToken.prefix || "—"}…</strong></span>
-              <span><small>生成时间</small><strong>{integrationToken.created_at ? new Date(integrationToken.created_at).toLocaleString("zh-CN") : "—"}</strong></span>
-            </div>
-          )}
-          {revealedIntegrationToken && (
-            <div className="integration-token-reveal">
-              <strong>请立即复制这枚令牌</strong>
-              <div>
-                <input
-                  readOnly
-                  value={revealedIntegrationToken}
-                  aria-label="新生成的外部导入令牌"
-                  onFocus={(event) => event.target.select()}
-                />
-                <button type="button" className="secondary" onClick={copyIntegrationToken}>复制令牌</button>
-                <button type="button" className="link" onClick={() => setRevealedIntegrationToken("")}>已保存，隐藏</button>
-              </div>
-            </div>
-          )}
-          {integrationTokenMessage && <p className="integration-token-message">{integrationTokenMessage}</p>}
-          {integrationTokenError && <p className="integration-token-error">{integrationTokenError}</p>}
-          <div className="button-row integration-token-actions">
-            <button
-              type="button"
-              className="secondary"
-              disabled={integrationTokenBusy || integrationToken == null}
-              onClick={createIntegrationToken}
-            >
-              {integrationTokenBusy
-                ? "处理中…"
-                : integrationToken?.configured
-                  ? "轮换令牌"
-                  : "生成令牌"}
-            </button>
-            {integrationToken?.configured && (
-              <button type="button" className="danger" disabled={integrationTokenBusy} onClick={revokeIntegrationToken}>
-                撤销令牌
-              </button>
-            )}
-          </div>
-        </section>
         <section className="card credential-cleanup">
           <div>
             <span className="kicker">敏感凭据清理</span>
@@ -882,10 +672,13 @@ export function Settings({
             {busy === "clear-all-keys" ? "删除中…" : "删除全部密钥"}
           </button>
         </section>
-        <button className="primary save" disabled={busy === "settings"}>{busy === "settings" ? "保存中…" : "保存设置"}</button>
       </form>
     </div>
   );
+}
+
+function formatWan(value: number): string {
+  return String(Math.trunc(value)).replace(/\B(?=(\d{4})+(?!\d))/g, ",");
 }
 
 function Field({ name, label, value, min, max, step = "1" }: { name: string; label: string; value: number; min: number; max?: number; step?: string }) {

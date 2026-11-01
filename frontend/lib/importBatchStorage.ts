@@ -59,6 +59,21 @@ export function rememberPackageBatch(batchId: string) {
   }
 }
 
+export function forgetImportBatch(batchId: string) {
+  for (const key of [
+    IMPORT_BATCH_STORAGE_KEY,
+    LOCAL_IMPORT_BATCH_STORAGE_KEY,
+    PACKAGE_IMPORT_STORAGE_KEY,
+  ]) {
+    try {
+      const ids = storedBatchIds(key).filter((item) => item !== batchId);
+      window.localStorage.setItem(key, JSON.stringify(ids));
+    } catch {
+      // Cache cleanup is best effort; the server remains authoritative.
+    }
+  }
+}
+
 export function storedPackageBatches() {
   return storedBatchIds(PACKAGE_IMPORT_STORAGE_KEY, 10);
 }

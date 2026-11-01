@@ -228,6 +228,20 @@
 .parse-page-btn:disabled { opacity:.4; cursor:not-allowed; }
 .parse-confirm-btn { background:linear-gradient(135deg,var(--amber),var(--pink)); border-color:transparent; color:#1a142a; font-weight:600; }
 .parse-confirm-btn:hover { opacity:.9; }
+button.parse-stat { font:inherit; color:inherit; text-align:left; width:100%; cursor:pointer; transition:background .15s,border-color .15s; }
+button.parse-stat:disabled { cursor:default; opacity:.45; }
+.parse-stat.active { color:#fff; }
+.parse-selectall-row { display:flex; align-items:center; gap:10px; padding:2px 2px 10px; }
+.parse-selectall-label { font-size:13px; color:var(--text); }
+.parse-selectall-hint { font-size:12px; color:var(--muted); }
+.parse-checkbox.partial { background:var(--cyan); border-color:var(--cyan); }
+.parse-checkbox.partial::after { content:""; width:9px; height:2px; border:none; border-radius:1px; background:#111; transform:none; }
+.parse-batch-bar { display:flex; justify-content:flex-end; gap:10px; margin-top:10px; }
+.parse-batch-del, .parse-batch-retry { font-size:13px; font-weight:600; padding:8px 14px; border-radius:var(--radius-small); border:1px solid transparent; cursor:pointer; color:#fff; }
+.parse-batch-del { background:#A32D2D; }
+.parse-batch-del:disabled { background:color-mix(in srgb,#A32D2D 42%,var(--panel)); color:var(--muted); cursor:default; }
+.parse-batch-retry { background:#185FA5; }
+.parse-batch-retry:disabled { background:color-mix(in srgb,#185FA5 42%,var(--panel)); color:var(--muted); cursor:default; }
 
 /* ---------- 模型配置 ---------- */
 .model-split { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:0; margin-top:6px; }

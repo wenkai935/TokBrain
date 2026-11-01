@@ -2,7 +2,7 @@
 rem 启动飞书同步桥（bridge_feishu_obsidian.py --watch 常驻）
 rem 用法：双击本文件，或在普通终端运行（勿在 WorkBuddy 沙箱内跑，避免 safe-delete shim 干扰文件操作）
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 rem ---- 飞书多维表格（obsidian知识库收件箱 -> 视频收藏表）----
 set FEISHU_BITABLE_APP_TOKEN=WmDJbX7jaaiDvksBX22c7IuLnAf
