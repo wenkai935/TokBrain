@@ -390,7 +390,22 @@ if versions != {"0.0.1.7"}:
             Stop-Setup @"
 安装前端依赖失败。
 本次使用的 npm 缓存目录：$NpmCachePath
-请先关闭其他 Node.js/npm 进程并重试；如果仍出现 EPERM，请检查安全软件是否拦截该目录。
+常见原因二选一：
+  1) package.json 与 package-lock.json 不同步（改了依赖却没更新 lock）——
+     执行：cd frontend; npm install --package-lock-only
+  2) npm 缓存目录被占用或被安全软件拦截——先关闭其他 Node.js/npm 进程再重试。
+"@
+        }
+
+        # optionalDependencies 装失败时 npm 只跳过、不报错（这是 optional 的语义）。
+        # 这里显式确认一次，免得用户以为浏览器解析通道可用，真解析时才报
+        # browser_unavailable——那个症状和「抖音拒绝」几乎一样，极难排查。
+        $PlaywrightCliBin = Join-Path $WorkspacePath "frontend\node_modules\.bin\playwright-cli.cmd"
+        if (-not (Test-Path -LiteralPath $PlaywrightCliBin)) {
+            Write-Warning @"
+浏览器解析通道的 playwright-cli 没有装上（它在前端 package.json 里属于
+optionalDependencies，装失败会被 npm 静默跳过）。抖音链接解析将不可用，其余功能不受影响。
+可手动补装：cd frontend; npm install @playwright/cli --no-save
 "@
         }
         Invoke-NativeStep -FilePath $NpmCommand.Source -Arguments @(

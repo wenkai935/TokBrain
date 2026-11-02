@@ -116,6 +116,24 @@ def _node_install_roots() -> list:
     return roots
 
 
+def _project_frontend_dir():
+    """项目自带的 frontend 目录（其下有 npm 装出来的 node_modules）。
+
+    ``npm ci`` 把 ``@playwright/cli`` 装在 ``frontend/node_modules`` 里——那是项目
+    局部安装，不会进 PATH。只扫全局安装目录的话，clone 用户明明装好了，解析通道
+    仍然会抛 ``browser_unavailable``；症状和「抖音拒绝」几乎一样，排查代价极高。
+
+    环境变量 ``TOKBRAIN_FRONTEND_DIR`` 可覆盖；默认按本文件位置推导项目根。
+    """
+    from pathlib import Path
+
+    env_dir = os.environ.get("TOKBRAIN_FRONTEND_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    # app/services/browser_resolver.py -> 上溯两级是项目根
+    return Path(__file__).resolve().parents[2] / "frontend"
+
+
 def _cli_script_candidates() -> list:
     """找出 ``playwright-cli.js`` 的候选位置。
 
@@ -130,6 +148,10 @@ def _cli_script_candidates() -> list:
     env_script = os.environ.get("TOKBRAIN_PLAYWRIGHT_CLI_JS", "").strip()
     if env_script:
         bases.append(Path(env_script))
+    # 项目自带的 node_modules：npm ci 装出来的 @playwright/cli 就在这里，它不在
+    # PATH 上，必须显式纳入。放在全局安装之前，是为了让所有机器都用 lock
+    # 锁定的同一个版本，而不是各自 PATH 里那个来路不明的。
+    bases.append(_project_frontend_dir())
     wrapper = shutil.which(CLI_NAME)
     if wrapper:
         bases.append(Path(wrapper).resolve().parent)

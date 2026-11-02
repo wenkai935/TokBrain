@@ -57,7 +57,7 @@ flowchart LR
 
 `ffmpeg` 可以加入 PATH，也可以把便携版解压到 `tools\ffmpeg\bin`，或用环境变量 `FFMPEG_BIN` 指向它的 `bin` 目录——安装与启动脚本都会自动探测（见 `docs/TokBrain依赖与构建清单.md`）。
 
-抖音批量下载与浏览器解析通道属于可选能力，`install` 会自动补齐它们的依赖：安装 `requirements-download.txt`（Playwright + yt-dlp）并下载 Chromium 浏览器内核（`playwright install chromium`，下载失败仅警告、不中断核心安装）；浏览器解析所需的 `@playwright/cli` 随前端 `npm ci` 一并到位。飞书同步桥还需系统 `PATH` 中有 `lark-cli`（缺失时启动器会提示，不阻断核心服务）。
+抖音批量下载与浏览器解析通道属于可选能力，`install` 会自动补齐它们的依赖：安装 `requirements-download.txt`（Playwright + yt-dlp）并下载 Chromium 浏览器内核（`playwright install chromium`，下载失败仅警告、不中断核心安装）；浏览器解析所需的 `@playwright/cli` 声明在前端 `optionalDependencies`，随 `npm ci` 装进 `frontend\node_modules`，解析通道直接调用项目内这一份（版本由 `package-lock.json` 锁定），**不需要全局安装**，也不占用系统 `PATH`。飞书同步桥还需系统 `PATH` 中有 `lark-cli`（缺失时启动器会提示，不阻断核心服务）。
 
 ```powershell
 git clone https://github.com/fyfsxkh/TokBrain.git

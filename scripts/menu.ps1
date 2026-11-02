@@ -252,7 +252,13 @@ function Get-StatusLines {
     }
     else { "缺失(可选)" }
 
-    $PlaywrightCli = if (Get-Command playwright-cli -ErrorAction SilentlyContinue) {
+    # playwright-cli 有两种来源：npm 局部装在 frontend\node_modules\.bin（局部安装
+    # 不会进 PATH），或全局装在 PATH。clone 用户走的是前者，所以必须先认项目内安装，
+    # 否则装完了状态面板还显示「缺失(可选)」。
+    $PlaywrightCli = if (Test-PathReady "frontend\node_modules\.bin\playwright-cli.cmd") {
+        "项目内"
+    }
+    elseif (Get-Command playwright-cli -ErrorAction SilentlyContinue) {
         "PATH"
     }
     else { "缺失(可选)" }
@@ -354,7 +360,7 @@ function Show-Status {
             # 免得又出现"显示运行中、点 [4] 却停不掉"的困惑。
             $Color = if ($Value -match "非受管|其他程序") { "Yellow" } else { "Green" }
         }
-        elseif ($Value -eq "OK" -or $Value -eq "PATH") {
+        elseif ($Value -eq "OK" -or $Value -eq "PATH" -or $Value -eq "项目内") {
             $Color = "Green"
         }
         elseif ($Value -eq "缺失" -or $Value -eq "未找到") {
