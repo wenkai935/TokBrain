@@ -1,0 +1,374 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "TokBrain-main 本机知识库架构",
+    "subtitle": "FastAPI :8001 · Next.js :3001 · 只读 MCP :8010 · 控制 MCP :8011",
+    "locale": "zh-CN",
+    "output": "tokbrain-architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main",
+        "label": "主链路",
+        "focus": [
+          "users",
+          "frontend",
+          "api",
+          "services",
+          "sqlite"
+        ],
+        "note": "浏览器 → 前端 → 本机 API → 服务层 → SQLite 与本地媒体，全程只走回环。"
+      },
+      {
+        "id": "agent",
+        "label": "对外 Agent 通道",
+        "focus": [
+          "control",
+          "mcplocal",
+          "hermes",
+          "api",
+          "sqlite"
+        ],
+        "note": "三条对外入口：只读 MCP、控制层、NAS 上的 Hermes stdio 适配器。"
+      },
+      {
+        "id": "sources",
+        "label": "素材来源与 AI",
+        "focus": [
+          "platform",
+          "feishu",
+          "api",
+          "services",
+          "bailian"
+        ],
+        "note": "链接、平台登录态、飞书收件箱三类素材入口，以及百炼侧的转写与向量化。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "users",
+      "type": "external",
+      "label": "用户 / 浏览器",
+      "sublabel": "本机操作",
+      "pos": [
+        30,
+        290
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "frontend",
+      "type": "frontend",
+      "label": "Next.js 前端",
+      "sublabel": ":3001 · 6 个组件",
+      "pos": [
+        230,
+        290
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "导入 / 库 / Cookie"
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI 后端",
+      "sublabel": ":8001 · 12 个 router",
+      "pos": [
+        440,
+        290
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "仅回环"
+    },
+    {
+      "id": "services",
+      "type": "backend",
+      "label": "服务层",
+      "sublabel": "32 个模块 · 3 个协调器",
+      "pos": [
+        650,
+        290
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "tag": "导入 / 数据包 / 任务"
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "SQLite + 媒体",
+      "sublabel": "WAL · 16 表 · 证据",
+      "pos": [
+        860,
+        290
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "platform",
+      "type": "external",
+      "label": "平台站点",
+      "sublabel": "抖音等 · 链接与登录态",
+      "pos": [
+        30,
+        130
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "bailian",
+      "type": "cloud",
+      "label": "阿里百炼 API",
+      "sublabel": "ASR / OCR / 向量 / 重排",
+      "pos": [
+        650,
+        130
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "ffmpeg",
+      "type": "backend",
+      "label": "ffmpeg / ffprobe",
+      "sublabel": "抽帧 · 转码",
+      "pos": [
+        860,
+        130
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "feishu",
+      "type": "external",
+      "label": "飞书多维表格",
+      "sublabel": "常驻桥接 → Obsidian",
+      "pos": [
+        30,
+        440
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "control",
+      "type": "backend",
+      "label": "控制层 · 33 工具",
+      "sublabel": "为 agent 预留的自动化工具",
+      "pos": [
+        230,
+        440
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "tokbrain_control"
+    },
+    {
+      "id": "mcplocal",
+      "type": "backend",
+      "label": "只读 MCP :8010",
+      "sublabel": "问答查询知识库工具",
+      "pos": [
+        860,
+        440
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "kb_*"
+    },
+    {
+      "id": "hermes",
+      "type": "external",
+      "label": "Hermes Agent",
+      "sublabel": "NAS 上的 Agent",
+      "pos": [
+        1070,
+        440
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "经 stdio 调用本机"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "本机 Windows",
+      "wraps": [
+        "frontend",
+        "api",
+        "services",
+        "sqlite",
+        "control",
+        "mcplocal",
+        "ffmpeg"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "回环 only :8001",
+      "wraps": [
+        "api"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "云端",
+      "wraps": [
+        "bailian"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "users-to-frontend",
+      "from": "users",
+      "to": "frontend",
+      "label": "HTTP :3001",
+      "variant": "emphasis"
+    },
+    {
+      "id": "frontend-to-api",
+      "from": "frontend",
+      "to": "api",
+      "label": "HTTP :8001"
+    },
+    {
+      "id": "api-to-services",
+      "from": "api",
+      "to": "services",
+      "label": "调用"
+    },
+    {
+      "id": "services-to-sqlite",
+      "from": "services",
+      "to": "sqlite",
+      "label": "SQL / 媒体写入",
+      "labelDy": 61,
+      "labelDx": -62
+    },
+    {
+      "id": "services-to-platform",
+      "from": "services",
+      "to": "platform",
+      "label": "解析链接",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "services-to-bailian",
+      "from": "services",
+      "to": "bailian",
+      "label": "ASR / OCR / 向量",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDx": -78
+    },
+    {
+      "id": "services-to-ffmpeg",
+      "from": "services",
+      "to": "ffmpeg",
+      "label": "抽帧",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDx": 52
+    },
+    {
+      "id": "feishu-to-api",
+      "from": "feishu",
+      "to": "api",
+      "label": "收件箱",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "control-to-api",
+      "from": "control",
+      "to": "api",
+      "label": "HTTP + Bearer",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "mcplocal-to-sqlite",
+      "from": "mcplocal",
+      "to": "sqlite",
+      "label": "只读 SQL",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "hermes-to-mcplocal",
+      "from": "hermes",
+      "to": "mcplocal",
+      "label": "问答检索",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "right"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "数据主线",
+      "items": [
+        "链接 / 本地视频 / 文件夹 / ZIP → 预检 → 人工确认 → 才产生 AI 费用",
+        "多模态处理后写入 SQLite + 媒体 + 证据，检索只认有证据的内容"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "对外 Agent 通道",
+      "items": [
+        "Hermes（NAS）经 stdio 拉出两条线：向下走问答查询知识库工具，向左走自动化操作",
+        "只读 MCP :8010 —— 问答查询知识库工具（kb_*），独立进程与独立 venv",
+        "控制层 33 个工具 —— 为 agent 预留的自动化工具，CLI 与控制 MCP :8011 共用同一份实现"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "边界与风险",
+      "items": [
+        "主服务无用户体系，靠 TrustedHost 限制回环",
+        "四个监听端口，非回环暴露必须逐个配令牌",
+        "cookie_store 集中存放各平台登录态，权限面敏感"
+      ]
+    }
+  ]
+}
