@@ -15,6 +15,12 @@ TokBrain 是单机、单用户、本地优先的知识库应用。它只处理�
 
 当前应用版本为 **v1.0.0**，数据库迁移目标为 **schema v11**，API contract 为 **7**。默认服务只监听本机：前端 `127.0.0.1:3001`，后端 `127.0.0.1:8001`。
 
+## 架构地图
+
+<p align="center">
+  <img src="docs/diagrams/tokbrain-architecture.png" alt="TokBrain 架构地图：浏览器 → Next.js 前端(:3001) → FastAPI 后端(:8001，仅回环) → 服务层(32 模块 + 3 协调器) → SQLite 与本地媒体；外部依赖为阿里百炼 API、ffmpeg、平台站点、飞书多维表格；Hermes 经只读 MCP(:8010) 做问答检索" width="100%">
+</p>
+
 ## 当前能力
 
 | 能力 | 当前行为 |
@@ -57,7 +63,7 @@ flowchart LR
 
 `ffmpeg` 可以加入 PATH，也可以把便携版解压到 `tools\ffmpeg\bin`，或用环境变量 `FFMPEG_BIN` 指向它的 `bin` 目录——安装与启动脚本都会自动探测（见 `docs/TokBrain依赖与构建清单.md`）。
 
-抖音批量下载与浏览器解析通道属于可选能力，`install` 会自动补齐它们的依赖：安装 `requirements-download.txt`（Playwright + yt-dlp）并下载 Chromium 浏览器内核（`playwright install chromium`，下载失败仅警告、不中断核心安装）；浏览器解析所需的 `@playwright/cli` 随前端 `npm ci` 一并到位。飞书同步桥还需系统 `PATH` 中有 `lark-cli`（缺失时启动器会提示，不阻断核心服务）。
+`install` 会一并安装飞书同步桥所需的项目内 `cli\node_modules\@larksuite\cli`，版本由 `cli\package-lock.json` 锁定，不需要用户全局安装 `lark-cli`。抖音批量下载与浏览器解析通道的依赖也会自动补齐：安装 `requirements-download.txt`（Playwright + yt-dlp）并下载 Chromium 浏览器内核；浏览器解析所需的 `@playwright/cli` 随前端 `npm ci` 安装到 `frontend\node_modules`。
 
 ```powershell
 git clone https://github.com/fyfsxkh/TokBrain.git
