@@ -173,3 +173,59 @@ async def test_browser_channel_ignores_broken_cookie(monkeypatch):
 
     real = import_queue.F2WorkClient()
     assert await import_queue._resolve_link(real, "https://v.douyin.com/a/", "") == "ok"
+
+
+def test_project_frontend_dir_defaults_to_repo_frontend():
+    """默认按本文件位置推导项目根/frontend，不依赖任何环境变量。"""
+    from pathlib import Path
+
+    expected = Path(browser_resolver.__file__).resolve().parents[2] / "frontend"
+    assert browser_resolver._project_frontend_dir() == expected
+
+
+def test_project_frontend_dir_honours_env_override(monkeypatch, tmp_path):
+    """TOKBRAIN_FRONTEND_DIR 可覆盖，给非标准部署留个出口。"""
+    monkeypatch.setenv("TOKBRAIN_FRONTEND_DIR", str(tmp_path))
+    assert browser_resolver._project_frontend_dir() == tmp_path
+
+
+def test_cli_candidates_include_project_node_modules(monkeypatch, tmp_path):
+    """项目局部安装必须被认到。
+
+    clone 用户把 @playwright/cli 装在 frontend/node_modules——那是项目局部安装，
+    不进 PATH。只扫全局目录的话，装完了仍然会抛 browser_unavailable，而那个
+    症状和「抖音拒绝」几乎一样，排查代价极高。
+    """
+    frontend = tmp_path / "frontend"
+    script = frontend / "node_modules" / "@playwright" / "cli" / "playwright-cli.js"
+    script.parent.mkdir(parents=True)
+    script.write_text("// stub", encoding="utf-8")
+
+    monkeypatch.setenv("TOKBRAIN_FRONTEND_DIR", str(frontend))
+    # 屏蔽本机可能存在的全局安装，让断言只反映项目内路径
+    monkeypatch.setattr(browser_resolver.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(browser_resolver, "_node_install_roots", list)
+
+    assert script in browser_resolver._cli_script_candidates()
+
+
+def test_cli_candidates_prefer_project_over_global(monkeypatch, tmp_path):
+    """项目内版本由 package-lock 锁定，优先级应高于 PATH 里来路不明的全局安装。"""
+    frontend = tmp_path / "frontend"
+    project_script = frontend / "node_modules" / "@playwright" / "cli" / "playwright-cli.js"
+    project_script.parent.mkdir(parents=True)
+    project_script.write_text("// stub", encoding="utf-8")
+
+    global_root = tmp_path / "global"
+    global_script = global_root / "node_modules" / "@playwright" / "cli" / "playwright-cli.js"
+    global_script.parent.mkdir(parents=True)
+    global_script.write_text("// stub", encoding="utf-8")
+
+    monkeypatch.setenv("TOKBRAIN_FRONTEND_DIR", str(frontend))
+    monkeypatch.setattr(browser_resolver.shutil, "which", lambda name: (
+        str(global_root / "playwright-cli") if name == browser_resolver.CLI_NAME else None
+    ))
+    monkeypatch.setattr(browser_resolver, "_node_install_roots", list)
+
+    candidates = browser_resolver._cli_script_candidates()
+    assert candidates.index(project_script) < candidates.index(global_script)
