@@ -27,7 +27,7 @@ Link resolution and AI processing require network access. The current release
 supports Windows only and is designed for one trusted user on one local
 machine.
 
-> Current version: **v1.0.0** (database **schema v9** /
+> Current version: **v1.0.0** (database **schema v11** /
 > **API contract 7**)
 > Latest release: **v1.0.0** (2026-08-11) · [Read the changelog](CHANGELOG.md) ·
 > [View the GitHub Release](https://github.com/fyfsxkh/TokBrain/releases/tag/v1.0.0)
@@ -256,7 +256,7 @@ Remote full videos are temporary processing inputs, not a permanent download
 library. Permanently deleting a work also removes associated local assets.
 Back up the database and asset directories from the same point in time.
 
-The development version uses **schema v9**. On first startup from an older
+The development version uses **schema v11**. On first startup from an older
 schema, TokBrain creates `data/backups/douyin_rag-pre-v9-*.db` before migrating
 historical works, summaries, chunks, keyframes, usage, and local collections.
 Upgrading from schema v4 still preserves link-import and ingestion queues.

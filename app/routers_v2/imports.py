@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import ImportBatch
+from app.models import ImportBatch, ImportItem, Job
 from app.schemas import (
     ImportBatchCreate,
     ImportConfirm,
     ImportItemUpdate,
+    ImportItemsRetryRequest,
     LocalImportBatchCreate,
 )
 from app.services.import_integrations import (
@@ -22,6 +24,7 @@ from app.services.import_queue import (
     coordinator,
     create_import_batch,
     delete_import_item,
+    _refresh_batch,
 )
 from app.services.local_assets import (
     LocalAssetError,
@@ -148,6 +151,50 @@ async def upload_local_import_video(
             status_code=status_code,
             detail=_import_error_detail(exc.code, str(exc)),
         ) from exc
+
+
+@router.post("/import-items/retry", response_model=dict)
+async def retry_import_items(
+    payload: ImportItemsRetryRequest,
+    session: AsyncSession = Depends(get_db),
+):
+    rows = (
+        await session.execute(select(ImportItem).where(ImportItem.id.in_(payload.item_ids)))
+    ).scalars().all()
+    found = {row.id for row in rows}
+    missing = [item_id for item_id in payload.item_ids if item_id not in found]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"导入条目不存在: {missing}")
+    retryable = {"failed", "cancelled", "blocked"}
+    skipped = [row.id for row in rows if row.status not in retryable]
+    retried = []
+    for row in rows:
+        if row.status in retryable:
+            batch = await session.get(ImportBatch, row.batch_id)
+            if not batch or batch.source_type != "link":
+                skipped.append(row.id)
+                continue
+            row.status = "queued"
+            row.error_code = None
+            row.error_message = None
+            row.worker_id = None
+            retried.append(row.id)
+    for batch_id in {row.batch_id for row in rows if row.id in retried}:
+        batch = await session.get(ImportBatch, batch_id)
+        batch.cancel_requested = False
+        batch.completed_at = None
+        batch.error_code = None
+        batch.error_message = None
+        job = await session.get(Job, batch.job_id)
+        if job:
+            job.cancel_requested = False
+            job.completed_at = None
+            job.progress = {key: value for key, value in (job.progress or {}).items()
+                            if key != "panel_hidden"}
+        await _refresh_batch(session, batch_id)
+    await session.commit()
+    await coordinator.enqueue(retried)
+    return {"retried": retried, "skipped": skipped}
 
 
 @router.patch("/import-items/{item_id}")

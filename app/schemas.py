@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -169,6 +169,10 @@ class ImportItemUpdate(StrictImportRequest):
     title: str | None = Field(default=None, min_length=1, max_length=500)
     description: str | None = Field(default=None, max_length=20_000)
     target_collection_id: int | None = Field(default=None, ge=1)
+
+
+class ImportItemsRetryRequest(StrictImportRequest):
+    item_ids: list[Annotated[int, Field(gt=0)]] = Field(min_length=1, max_length=100)
 
 
 class ExternalImportItemCreate(StrictImportRequest):

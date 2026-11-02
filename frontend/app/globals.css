@@ -60,6 +60,7 @@ button,input,textarea,select { font:inherit; }
 .muted,.chat-intro p,.empty p { font-size:14px; }
 .work-body h3 { font-size:16px; min-height:auto; }
 .field select { width:100%; padding:11px 12px; border:1px solid var(--line); background:#0f1316; color:var(--text); outline:none; }
+.field select:disabled { opacity:1; color:var(--text); -webkit-text-fill-color:var(--text); cursor:default; }
 .technical-details { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); }
 .technical-details-title { display:block; color:var(--muted); font-size:12px; }
 .work-title-link { color:inherit; text-decoration:none; }
@@ -305,7 +306,8 @@ button,input,textarea,select { font:inherit; }
 .input-with-button { display:flex; align-items:center; gap:10px; border:1px solid var(--line); background:var(--input-bg,#0f1316); padding-right:8px; }
 .input-with-button input { flex:1; min-width:0; border:0; padding:11px 12px; background:transparent; color:var(--text); }
 .input-with-button input:focus { outline:0; }
-.input-with-button button { flex:none; padding:7px 14px; }
+.input-with-button button { flex:none; padding:5px 12px; font-size:11px; border-radius:6px; }
+.input-with-button button.secondary.saved { border-color:#27655e; color:var(--cyan); }
 .input-with-button:focus-within { border-color:var(--cyan); }
 .button-row.group-save { grid-column:1 / -1; justify-content:flex-end; margin-top:0; }
 .billing-credentials-status>div { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px; }

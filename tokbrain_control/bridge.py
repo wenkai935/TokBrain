@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -36,7 +37,7 @@ BRIDGE_LOG = PROJECT_ROOT / "data" / "logs" / "bridge-watch.log"
 #: 终态。bridge 的 ``pending_items()`` 用 ``NOT IN TERMINAL`` 取件，
 #: 所以把 failed 改回 queued 等于「重新投进慢轨」。
 TERMINAL_STATES = ("processed", "needs_supplement", "failed", "awaiting_confirm")
-ACTIVE_STATES = ("pending", "queued", "processing")
+ACTIVE_STATES = ("pending", "queued", "processing", "ingested")
 #: 预检已完成、等确认的条目。它们不在慢轨里，也不能算 in_flight——
 #: 球在用户/agent 那边，不是在后台。
 AWAITING_CONFIRM = "awaiting_confirm"
@@ -59,10 +60,10 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
 def _python() -> str:
-    """优先用可用的下载环境，回退到项目 .venv。"""
-    workbuddy = Path(r"C:\Users\xxsyl\.workbuddy\binaries\python\envs\default\Scripts\python.exe")
-    if workbuddy.is_file():
-        return str(workbuddy)
+    """Explicit override, project environment, then current interpreter."""
+    override = os.environ.get("TOKBRAIN_BRIDGE_PYTHON", "").strip()
+    if override:
+        return override
     candidate = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
     if candidate.is_file():
         return str(candidate)
@@ -473,18 +474,10 @@ def start(
     env.setdefault("VAULT_PATH", DEFAULT_VAULT)
     env["FS_NO_DOUYIN"] = "0" if download else "1"
     env["FS_AUTO_CONFIRM"] = "1" if auto_confirm else "0"
-    lark_exe = Path(r"C:\Users\xxsyl\.trae-cn\plugins\trae-remote-official\lark\1.0.5\bin\lark-cli.exe")
-    if lark_exe.is_file():
-        env["LARK_CLI_EXE"] = str(lark_exe)
-        env["LARK_CLI_DIR"] = str(lark_exe.parent.parent)
-    # WorkBuddy 环境提供 yt-dlp/Playwright；项目环境提供 requests 等桥依赖。
-    # 两者均在本机，按路径合并，避免把下载能力锁死在 .venv。
-    project_site = PROJECT_ROOT / ".venv" / "Lib" / "site-packages"
-    if project_site.is_dir():
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = os.pathsep.join(
-            part for part in [str(project_site), str(PROJECT_ROOT), existing_pythonpath] if part
-        )
+    # Keep interpreters isolated: native dependencies must match their Python ABI.
+    lark_exe = shutil.which("lark-cli.exe") or shutil.which("lark-cli")
+    if lark_exe:
+        env.setdefault("LARK_CLI_EXE", lark_exe)
     # bridge 用 requests，而 requests 默认 trust_env：系统里配了 HTTP_PROXY
     # （Clash/VPN/CI 都会配）时，连 http://127.0.0.1:8001 也会被推给代理，
     # 代理按 absolute-form 转发，后端收到 path 是 "http://127.0.0.1:8001/api/..."

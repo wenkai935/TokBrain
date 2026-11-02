@@ -1,5 +1,8 @@
 {
   "dependencies": {
     "@larksuite/cli": "^1.0.98"
+  },
+  "allowScripts": {
+    "@larksuite/cli@1.0.98": true
   }
 }

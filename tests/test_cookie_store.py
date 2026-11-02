@@ -167,7 +167,7 @@ def test_cookie_file_mode_is_private(isolated_cookie_dir):
 
 async def test_header_falls_back_to_legacy_secret(isolated_cookie_dir, monkeypatch):
     async def fake_get_secret(_session, name):
-        return "sessionid=legacy; ttwid=legacy-ttwid" if name == "f2_cookie" else None
+        return "sessionid=legacy; ttwid=legacy" if name == "f2_cookie" else None
 
     monkeypatch.setattr("app.services.secrets.get_secret", fake_get_secret)
 

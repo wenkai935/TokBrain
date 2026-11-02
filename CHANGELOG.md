@@ -2,6 +2,33 @@
 
 本文件记录 TokBrain 面向用户的重要版本变化。版本日期采用上海时区。
 
+## [Unreleased] — 2026-11-02 · 导入审查与隔离回归修复
+
+- 清理任务面板改为持久化隐藏状态，不再通过 Job 外键级联删除批次和素材。
+- 批量重试恢复链接批次与 Job 状态后调用真实预检队列；非链接批次安全跳过。
+- 预检结束状态补齐 `duplicate` 与 `blocked`，补件异常保留 Work 关联。
+- 真实下载模式复用已处理作品，避免对排队中或处理中作品重复提交。
+- 移除个人绝对路径和跨解释器依赖混用；桥接 Python 与 lark-cli 统一按项目路径或显式环境变量解析。
+- 补件完成后清理 metadata-only 标记，控制面将 `ingested` 纳入处理中状态。
+- 新增隔离数据库和伪客户端回归测试；未执行真实飞书写入、平台下载或 NAS 交接验收。
+
+## [Unreleased] — 2026-11-02 · 修复 `@playwright/cli` 声明与锁文件不同步 + 解析通道认项目内安装
+
+`package.json` 声明了 `optionalDependencies: @playwright/cli`，但 `package-lock.json` 里没有同步记录它。这个不同步**不是"少装一个包"那么轻**——`npm ci` 在装包之前就会校验两者一致性，直接 fatal 退出：
+
+```
+npm error `npm ci` can only install packages when your package.json and package-lock.json are in sync.
+Missing: @playwright/cli@0.1.23 from lock file
+```
+
+也就是说 clone 用户点 `[1] 安装/重建`，会在装前端依赖这步整个卡死，连带着后面的 Python 环境、f2 运行时、前端构建全部走不到。
+
+- **同步锁文件**：执行 `npm install --package-lock-only` 补齐 `@playwright/cli@0.1.23` 条目（含 integrity 与 bin 声明）。`lockfileVersion` 保持 3 不变，npm 10 兼容；被 npm 顺带规范化掉的只是 `libc` 元数据字段，无语义变化。实测 `npm ci --dry-run` 通过。
+- **解析通道认项目内安装**（更深的缺口）：`browser_resolver.py` 找 `playwright-cli.js` 时只扫全局安装目录，**没有把项目自己的 `frontend/node_modules` 当候选**。`npm ci` 装出来的是项目局部安装，不进 PATH——所以即便锁文件修好了、依赖也装上了，解析通道仍然找不到它，照样抛 `browser_unavailable`。那个症状和「抖音拒绝」几乎一样，排查代价极高。新增 `_project_frontend_dir()`（可用 `TOKBRAIN_FRONTEND_DIR` 覆盖），把项目内安装纳入候选，且**优先级高于 PATH 里那个来路不明的全局安装**——项目内版本由锁文件锁定，所有机器一致。
+- **启动器状态面板**：原先只查 `PATH` 里的 `playwright-cli`，而 npm 局部安装不会进 PATH，所以 clone 用户装完仍显示「缺失(可选)」。改为先认 `frontend\node_modules\.bin\playwright-cli.cmd`，就绪时显示「项目内」。
+- **`setup.ps1` 报错分流**：`npm ci` 失败时区分两种原因并给出对应修法——锁文件不同步（`npm install --package-lock-only`）与缓存目录被占用/被安全软件拦截（关掉其他 Node 进程后重试）。`npm ci` 成功后再显式确认 `@playwright/cli` 是否真的装上：`optionalDependencies` 装失败时 npm 只静默跳过、不报错，不确认的话用户会以为解析通道可用，真解析时才炸。
+- **验证**：`tests/test_browser_resolver.py` 新增 4 条用例（项目根推导、环境变量覆盖、候选含项目内路径、项目内优先于全局），14 passed。
+
 ## [Unreleased] — 2026-11-02 · 下载板块入库 + 安装自动补依赖 + 飞书桥授权确认
 
 clone 用户此前拿不到下载脚本（它躺在 `D:/Temp`，不在版本库），且 `install` 不装 Playwright / yt-dlp / Chromium，导致下载板块与浏览器解析通道在他人机器上根本跑不起来。

@@ -66,6 +66,32 @@ function Test-PathReady {
     return (Test-Path -LiteralPath (Join-Path $Root $RelativePath))
 }
 
+function Test-PythonReady {
+    param([string]$RelativePath)
+
+    $Python = Join-Path $Root $RelativePath
+    if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { return $false }
+    $PreviousExitCode = $global:LASTEXITCODE
+    try {
+        & $Python -c "pass" 2>$null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $global:LASTEXITCODE = $PreviousExitCode
+    }
+}
+
+function Test-LarkCliReady {
+    return (
+        (Test-PathReady "cli\node_modules\@larksuite\cli\bin\lark-cli.exe") -or
+        (Test-PathReady "cli\node_modules\.bin\lark-cli.cmd") -or
+        [bool](Get-Command lark-cli -ErrorAction SilentlyContinue)
+    )
+}
+
 function Get-RuntimeIdentity {
     # 只读 data\runtime.json，取出 start.ps1 记录的监听 PID。文件缺失或损坏
     # 一律当作"没有受管实例"，绝不因为读不懂就去猜。
@@ -211,10 +237,14 @@ function Get-StatusLines {
     # 还是 [11] 才能停的开发模式实例。
     $Managed = Get-RuntimeIdentity
     $Records = Get-ProcessRecords -ProcessIds @($Map.Values)
-    $BackendEnv = if (Test-PathReady ".venv\Scripts\python.exe") { "OK" } else { "缺失" }
+    $BackendEnv = if (Test-PythonReady ".venv\Scripts\python.exe") { "OK" }
+        elseif (Test-PathReady ".venv\Scripts\python.exe") { "损坏（请重装）" }
+        else { "缺失" }
     $FrontendDeps = if (Test-PathReady "frontend\node_modules") { "OK" } else { "缺失" }
     $FrontendBuild = if (Test-PathReady "frontend\.next\BUILD_ID") { "OK" } else { "缺失" }
-    $McpEnv = if (Test-PathReady ".venv-mcp\Scripts\python.exe") { "OK" } else { "未安装(可选)" }
+    $McpEnv = if (Test-PythonReady ".venv-mcp\Scripts\python.exe") { "OK" }
+        elseif (Test-PathReady ".venv-mcp\Scripts\python.exe") { "损坏（请重装）" }
+        else { "未安装(可选)" }
     # 控制面要两样东西：MCP 环境 + control.env（含令牌）。只提示，不代填。
     $ControlEnv = if (Test-PathReady "mcp_server\control.env") { "OK" } else { "未配置(可选)" }
     $Ffmpeg = $null
@@ -247,12 +277,18 @@ function Get-StatusLines {
     $Playwright = if (Test-PathReady ".venv\Lib\site-packages\playwright") {
         "OK"
     }
-    elseif (-not (Test-PathReady ".venv\Scripts\python.exe")) {
+    elseif (-not (Test-PythonReady ".venv\Scripts\python.exe")) {
         "需先装 .venv"
     }
     else { "缺失(可选)" }
 
-    $PlaywrightCli = if (Get-Command playwright-cli -ErrorAction SilentlyContinue) {
+    # playwright-cli 有两种来源：npm 局部装在 frontend\node_modules\.bin（局部安装
+    # 不会进 PATH），或全局装在 PATH。clone 用户走的是前者，所以必须先认项目内安装，
+    # 否则装完了状态面板还显示「缺失(可选)」。
+    $PlaywrightCli = if (Test-PathReady "frontend\node_modules\.bin\playwright-cli.cmd") {
+        "项目内"
+    }
+    elseif (Get-Command playwright-cli -ErrorAction SilentlyContinue) {
         "PATH"
     }
     else { "缺失(可选)" }
@@ -302,10 +338,13 @@ function Get-StatusLines {
     }
     if (-not $YtDlp) { $YtDlp = "缺失(可选)" }
 
-    $LarkCli = if (Get-Command lark-cli -ErrorAction SilentlyContinue) {
+    $LarkCli = if (Test-PathReady "cli\node_modules\@larksuite\cli\bin\lark-cli.exe") {
+        "项目内"
+    }
+    elseif (Get-Command lark-cli -ErrorAction SilentlyContinue) {
         "PATH"
     }
-    else { "缺失(可选)" }
+    else { "缺失（请重装）" }
 
     return @(
         @("项目目录", $Root),
@@ -354,7 +393,7 @@ function Show-Status {
             # 免得又出现"显示运行中、点 [4] 却停不掉"的困惑。
             $Color = if ($Value -match "非受管|其他程序") { "Yellow" } else { "Green" }
         }
-        elseif ($Value -eq "OK" -or $Value -eq "PATH") {
+        elseif ($Value -eq "OK" -or $Value -eq "PATH" -or $Value -eq "项目内") {
             $Color = "Green"
         }
         elseif ($Value -eq "缺失" -or $Value -eq "未找到") {
@@ -662,7 +701,7 @@ function Invoke-DevStop {
 }
 
 function Invoke-Mcp {
-    if (-not (Test-PathReady ".venv-mcp\Scripts\python.exe")) {
+    if (-not (Test-PythonReady ".venv-mcp\Scripts\python.exe")) {
         Write-Host "  MCP 环境未安装。先执行安装，并在询问 MCP 时回答 y。" -ForegroundColor Yellow
         Write-Host "  等价命令：.\scripts\setup.ps1 -WithMcp" -ForegroundColor DarkGray
         return
@@ -671,7 +710,7 @@ function Invoke-Mcp {
 }
 
 function Invoke-Control {
-    if (-not (Test-PathReady ".venv-mcp\Scripts\python.exe")) {
+    if (-not (Test-PythonReady ".venv-mcp\Scripts\python.exe")) {
         Write-Host "  控制面与只读 MCP 共用 .venv-mcp，但该环境未安装。" -ForegroundColor Yellow
         Write-Host "  等价命令：.\scripts\setup.ps1 -WithMcp" -ForegroundColor DarkGray
         return
@@ -693,19 +732,18 @@ function Invoke-Bridge {
         [string]$Sub = "status",
         [switch]$Confirm
     )
-    if (-not (Test-PathReady ".venv\Scripts\python.exe")) {
+    if (-not (Test-PythonReady ".venv\Scripts\python.exe")) {
         Write-Host "  .venv 未安装，无法控制飞书同步桥。" -ForegroundColor Yellow
         Write-Host "  等价命令：.\scripts\setup.ps1" -ForegroundColor DarkGray
         return
     }
     if ($Sub -eq "start" -and $Confirm) {
         # 飞书同步桥会访问用户已授权的飞书账号与多维表格，启动前必须确认授权范围。
-        $LarkCli = Get-Command lark-cli -ErrorAction SilentlyContinue
         Write-Host ""
-        if (-not $LarkCli) {
+        if (-not (Test-LarkCliReady)) {
             Write-Host "  ⚠ 未检测到 lark-cli（飞书授权客户端）。" -ForegroundColor Yellow
             Write-Host "  飞书同步桥需要 lark-cli 登录你的飞书账号才能读写多维表格。" -ForegroundColor White
-            Write-Host "  请先在设置页完成「飞书授权」，或安装 lark-cli 后再启动。" -ForegroundColor DarkGray
+            Write-Host "  请重新执行安装，再在设置页完成「飞书授权」。" -ForegroundColor DarkGray
             $Answer = Read-Host "  仍要尝试启动飞书同步桥？(y/N)"
             if ($Answer -notmatch '^[yY]') {
                 Write-Host "  已取消启动。" -ForegroundColor Gray
@@ -786,8 +824,9 @@ function Invoke-Action {
 }
 
 if ($Action -ne "menu") {
+    $global:LASTEXITCODE = 0
     Invoke-Action -Name $Action
-    exit 0
+    exit $LASTEXITCODE
 }
 
 while ($true) {

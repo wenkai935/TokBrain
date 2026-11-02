@@ -1180,7 +1180,9 @@ def backfill_note(tb: TokBrain, work_id, item) -> Path:
     仅链接入库的 work（无媒体）走轻量 frontmatter 回填，不依赖媒体 manifest。
     """
     if work_id in _METADATA_ONLY_WORK_IDS:
-        return _backfill_note_metadata_only(work_id, item)
+        if work_processing_state(work_id) != "processed":
+            return _backfill_note_metadata_only(work_id, item)
+        _METADATA_ONLY_WORK_IDS.discard(work_id)
     note_path = Path(item["note_path"])
     note_path.parent.mkdir(parents=True, exist_ok=True)
     items = tb.obsidian_manifest([work_id])
@@ -1283,6 +1285,10 @@ class NeedsSupplement(Exception):
     这是一个等待人工处理的终态，不是失败——不应自动重投。
     """
 
+    def __init__(self, message: str = "", work_id: int | None = None) -> None:
+        self.work_id = work_id
+        super().__init__(message)
+
 
 class AwaitingConfirm(Exception):
     """预检已完成，但按 FS_AUTO_CONFIRM=0 停下来等确认。
@@ -1301,10 +1307,16 @@ class AwaitingConfirm(Exception):
         )
 
 
+class AwaitingPreview(Exception):
+    def __init__(self, batch_id):
+        self.batch_id = batch_id
+        super().__init__("预检进行中，下轮继续检查原批次")
+
+
 # 预检进行中的状态：需要继续轮询
 _PRECHECK_PENDING = {"", None, "pending", "queued", "prechecking", "processing", "reserved"}
 # 预检结束的状态
-_PRECHECK_DONE = {"ready", "needs_local_file", "failed", "rejected", "cancelled", "deduplicated"}
+_PRECHECK_DONE = {"ready", "needs_local_file", "failed", "rejected", "cancelled", "deduplicated", "duplicate", "blocked"}
 # 仅链接入库（无媒体）的 work：回填时跳过媒体 manifest，改用轻量 frontmatter 更新。
 # 由 process_link 的 metadata_only 分支登记，backfill_note 据此分流。
 _METADATA_ONLY_WORK_IDS: set = set()
@@ -1312,7 +1324,7 @@ _METADATA_ONLY_WORK_IDS: set = set()
 
 def wait_precheck(tb: TokBrain, batch_id):
     """轮询直到所有条目预检结束，返回 items 列表。"""
-    deadline = time.time() + POLL_TIMEOUT
+    deadline = time.time() + min(POLL_TIMEOUT, 10)
     items = []
     while time.time() < deadline:
         view = tb.get_batch(batch_id)
@@ -1323,15 +1335,17 @@ def wait_precheck(tb: TokBrain, batch_id):
     return items
 
 
-def process_link(tb: TokBrain, link, tags):
+def process_link(tb: TokBrain, link, tags, *, batch_id=None):
     """链接导入全流程，返回 work_ids。"""
     if FS_NO_DOUYIN:
         # 放弃抖音解析：长链确认 + 元数据 Work 入库（默认，见 process_link_metadata_only）
         return process_link_metadata_only(tb, link, tags)
     print(f"[import-link] {link}")
-    batch_id = tb.import_link(link)
+    batch_id = batch_id or tb.import_link(link)
     # 等预检真正结束（之前只要拿到 item id 就 confirm，结果在预检失败时会撞 409）
     items = wait_precheck(tb, batch_id)
+    if not items or any(str(i.get("status") or "").lower() not in _PRECHECK_DONE for i in items):
+        raise AwaitingPreview(batch_id)
     if not items:
         raise RuntimeError("链接预检超时，可能链接无效或被风控(423/429)")
 
@@ -1340,6 +1354,20 @@ def process_link(tb: TokBrain, link, tags):
     ]
     failed = [i for i in items if str(i.get("status") or "").lower() == "failed"]
     if not confirmable:
+        duplicate_ids = [
+            int(i["existing_work_id"])
+            for i in items
+            if i.get("existing_work_id") and str(i.get("status") or "").lower() in ("deduplicated", "duplicate")
+        ]
+        if duplicate_ids:
+            work_ids = list(dict.fromkeys(duplicate_ids))
+            unfinished = [wid for wid in work_ids if work_processing_state(wid) not in
+                          {"processed", "queued", "processing"}]
+            if unfinished:
+                if not FS_AUTO_CONFIRM:
+                    raise NeedsSupplement("已有作品尚未解析，等待明确放行", work_id=unfinished[0])
+                tb.ingest(unfinished)
+            return work_ids
         detail = "；".join(
             f"{i.get('error_code') or 'error'}: {i.get('error_message') or '未知原因'}"
             for i in failed
@@ -1372,8 +1400,8 @@ def process_link(tb: TokBrain, link, tags):
             tb.add_works_to_collection(collection_id, work_ids)
         except Exception as e:
             print(f"  [warn] 补挂收藏夹失败（不影响处理）: {e}")
-    job = tb.ingest(work_ids)
-    tb.wait_job(job["id"])
+    tb.ingest(work_ids)
+    # The next watch cycle resumes via dispatch.work_id; do not block collection.
 
     # 处理完检查是否需要「本地补件」：作者关闭下载时 TokBrain 拿不到视频流，
     # 此时作品停在 needs_supplement，导出也只会是一篇空笔记。
@@ -1381,7 +1409,8 @@ def process_link(tb: TokBrain, link, tags):
     if need_sup:
         raise NeedsSupplement(
             f"作品 {need_sup} 需要本地补件（作者未开放下载，TokBrain 未取得视频/音频/字幕）。"
-            "请在 TokBrain 网页手动上传完整视频后重试，或换一条允许下载的视频。"
+            "请在 TokBrain 网页手动上传完整视频后重试，或换一条允许下载的视频。",
+            work_id=int(need_sup[0]),
         )
     return work_ids
 
@@ -1393,7 +1422,7 @@ def process_link_metadata_only(tb: TokBrain, link, tags):
     一条无媒体 Work（confirm 直接产出），Obsidian 笔记保留占位 + 链接，后续
     在 TokBrain 网页为该 work 补件后由现有补件/回填链路接管富化。
 
-    返回 work_ids。无媒体是预期态，不抛 NeedsSupplement，也不触发 ingest。
+    无媒体保留 work_id 并进入 NeedsSupplement，补件完成后由回扫写回正文。
     """
     print(f"[import-link:metadata-only] {link}")
     batch_id = tb.import_link(link, metadata_only=True)
@@ -1403,6 +1432,16 @@ def process_link_metadata_only(tb: TokBrain, link, tags):
         if str(i.get("status") or "").lower() in ("ready", "needs_local_file")
     ]
     if not confirmable:
+        duplicate_ids = [
+            int(i["existing_work_id"])
+            for i in (items or [])
+            if i.get("existing_work_id") and str(i.get("status") or "").lower() in ("deduplicated", "duplicate")
+        ]
+        if duplicate_ids:
+            raise NeedsSupplement(
+                f"发现重复作品 {duplicate_ids}，等待检查已有内容并完成回写",
+                work_id=duplicate_ids[0],
+            )
         detail = "；".join(
             f"{i.get('error_code') or 'error'}: {i.get('error_message') or '未知原因'}"
             for i in (items or [])
@@ -1427,7 +1466,10 @@ def process_link_metadata_only(tb: TokBrain, link, tags):
     for wid in work_ids:
         _METADATA_ONLY_WORK_IDS.add(wid)
     print(f"  [metadata-only] work {work_ids} 已确认入库（无媒体，可在 TokBrain 网页补件）")
-    return work_ids
+    raise NeedsSupplement(
+        f"作品 {work_ids} 仅完成元数据入库，未取得视频媒体，等待补件后继续解析",
+        work_id=int(work_ids[0]),
+    )
 
 
 def process_local(tb: TokBrain, local_path, tags):
@@ -1438,17 +1480,6 @@ def process_local(tb: TokBrain, local_path, tags):
     tb.upload_external_asset(batch_id, cid, local_path)
     resp = tb.commit_external_batch(batch_id, start_processing=True)
     work_ids = resp.get("work_ids") or []
-    job = resp.get("job")
-    if job and job.get("job_id"):
-        tb.wait_job(job["job_id"])
-    else:
-        # 没有回传 job 时，直读数据库等待处理完成
-        deadline = time.time() + POLL_TIMEOUT
-        while time.time() < deadline:
-            states = [work_processing_state(w) for w in work_ids]
-            if all(s in ("processed", "failed") for s in states):
-                break
-            time.sleep(POLL_INTERVAL)
     if not work_ids:
         raise RuntimeError("v1 批次未产生 work_id，可能文件无效或已存在重复")
     # 本地导入没有 confirm 环节，入库后补挂收藏夹（方案 B 同名规则）
@@ -1563,7 +1594,14 @@ def rescan_supplements(tb: TokBrain, store: DispatchStore) -> int:
             work_id = _work_id_by_source_url(str(item["link"]).strip())
         if work_id is None:
             continue
-        if work_processing_state(work_id) != "processed":
+        work_state = work_processing_state(work_id)
+        if work_state in {"failed", "needs_supplement"}:
+            status = "needs_supplement" if work_state == "needs_supplement" else "failed"
+            store.update(rid, status=status, work_id=work_id,
+                         error_code=status, error_message=f"作品 {work_id} 处理结果: {work_state}")
+            mark_note_status(item, status)
+            continue
+        if work_state != "processed":
             continue
         try:
             note_path = backfill_note(tb, work_id, item)
@@ -1604,7 +1642,14 @@ def resume_ingested(tb: TokBrain, store: DispatchStore) -> int:
         if work_id is None:
             print(f"[warn] {rid} 已确认解析但找不到对应作品，留在队列等人工处理")
             continue
-        if work_processing_state(work_id) != "processed":
+        work_state = work_processing_state(work_id)
+        if work_state in {"failed", "needs_supplement"}:
+            status = "needs_supplement" if work_state == "needs_supplement" else "failed"
+            store.update(rid, status=status, work_id=work_id,
+                         error_code=status, error_message=f"作品 {work_id} 处理结果: {work_state}")
+            mark_note_status(item, status)
+            continue
+        if work_state != "processed":
             continue
         try:
             title = resolve_collection_title(item.get("tags") or "")
@@ -1629,7 +1674,7 @@ def resume_ingested(tb: TokBrain, store: DispatchStore) -> int:
     return done
 
 
-def process_queue(tb: TokBrain, store: DispatchStore) -> None:
+def process_queue(tb: TokBrain, store: DispatchStore, state=None) -> None:
     """慢轨：消费队列，处理完成后回填笔记。
 
     非终态条目（上次跑到一半的）会被自动接管续跑；failed 为终态，需人工重投。
@@ -1640,7 +1685,8 @@ def process_queue(tb: TokBrain, store: DispatchStore) -> None:
         return
     print(f"[slow] 待处理 {len(items)} 条，开始回填链路")
 
-    for item in items:
+    # Bound each watch cycle so new collections and writeback remain responsive.
+    for item in items[:1]:
         rid, link = item["record_id"], item["link"]
         try:
             store.update(rid, status="queued")
@@ -1648,17 +1694,37 @@ def process_queue(tb: TokBrain, store: DispatchStore) -> None:
             if local_path:
                 work_ids = process_local(tb, local_path, item["tags"])
             else:
-                work_ids = process_link(tb, link, item["tags"])
+                batch_id = item.get("batch_id") if item.get("error_code") == "preview_pending" else None
+                if batch_id:
+                    work_ids = process_link(tb, link, item["tags"], batch_id=batch_id)
+                else:
+                    work_ids = process_link(tb, link, item["tags"])
             store.update(rid, status="processing", work_id=work_ids[0] if work_ids else None)
+            if not work_ids:
+                raise RuntimeError("未返回作品 ID")
+            if work_processing_state(work_ids[0]) != "processed":
+                store.update(rid, status="ingested", work_id=work_ids[0],
+                             error_code="", error_message="")
+                continue
             note_path = backfill_note(tb, work_ids[0], item)
             store.update(rid, status="processed", work_id=work_ids[0],
                          note_path=str(note_path), error_code="", error_message="")
             print(f"[ok] {link or local_path} -> 已回填")
         except NeedsSupplement as e:
-            store.update(rid, status="needs_supplement", error_code="needs_supplement",
+            note_path = item.get("note_path") or ""
+            if e.work_id:
+                try:
+                    note_path = str(backfill_note(tb, e.work_id, item))
+                except Exception as backfill_error:
+                    print(f"  [warn] 无媒体作品元数据回写失败: {backfill_error}")
+            store.update(rid, status="needs_supplement", work_id=e.work_id or item.get("work_id"),
+                         note_path=note_path, error_code="needs_supplement",
                          error_message=str(e)[:500])
-            mark_note_status(item, "needs_supplement", str(e))
+            mark_note_status({**item, "note_path": note_path}, "needs_supplement", str(e))
             print(f"[wait] {link} -> 需要本地补件，等待人工上传视频")
+        except AwaitingPreview as e:
+            store.update(rid, status="queued", batch_id=e.batch_id,
+                         error_code="preview_pending", error_message=str(e))
         except AwaitingConfirm as e:
             # 记下 batch_id：确认入口（网页 / tb_sync_confirm）靠它找回批次。
             store.update(rid, status="awaiting_confirm", batch_id=e.batch_id,
@@ -1670,6 +1736,9 @@ def process_queue(tb: TokBrain, store: DispatchStore) -> None:
                          error_message=str(e)[:500])
             mark_note_status(item, "failed", str(e))
             print(f"[fail] {link}: {e}")
+        finally:
+            if state is not None:
+                writeback_feishu_status(store, state)
 
 
 def writeback_feishu_status(store: DispatchStore, state: dict) -> None:
@@ -1857,7 +1926,8 @@ def run_once(tb: TokBrain, store: DispatchStore, state: dict) -> dict:
                 store.update(item["record_id"], note_path=str(note))
 
         # ---- 慢轨：处理并回填（失败不影响已归档的占位笔记）----
-        process_queue(tb, store)
+        writeback_feishu_status(store, state)
+        process_queue(tb, store, state)
 
         # 网页/控制面已确认解析的条目：补收藏夹 + 回填笔记（解析没跑完会自动跳过）
         resume_ingested(tb, store)
@@ -1890,6 +1960,7 @@ def run_once(tb: TokBrain, store: DispatchStore, state: dict) -> dict:
 
 
 def main():
+    print(f"[mode] download={not FS_NO_DOUYIN} auto_confirm={FS_AUTO_CONFIRM}", flush=True)
     tb = TokBrain()
     store = DispatchStore()
     state = load_sync_state()

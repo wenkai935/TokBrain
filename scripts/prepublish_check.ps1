@@ -74,6 +74,8 @@ $requiredFiles = @(
     "requirements-billing.txt",
     "requirements-dev.txt",
     "requirements-f2.txt",
+    "cli/package.json",
+    "cli/package-lock.json",
     "frontend/package.json",
     "frontend/package-lock.json",
     ".github/workflows/ci.yml",
@@ -301,6 +303,7 @@ if ($Full) {
         & ".\.venv\Scripts\python.exe" -m compileall -q app scripts tests
     }
     Invoke-Checked "Backend tests" {
+        [void](New-Item -ItemType Directory -Force -Path ".test-tmp")
         & ".\.venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider `
             --basetemp ".test-tmp\prepublish"
     }

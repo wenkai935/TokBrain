@@ -76,8 +76,8 @@ _NAME_RE = re.compile(r"^[^\s=;,\t\r\n]+$")
 
 _NETSCAPE_HEADER = (
     "# Netscape HTTP Cookie File\n"
-    "# 由 TokBrain 设置页统一管理，重新上传会整份覆盖本文件。\n"
-    "# 手工编辑请保持 7 个 Tab 分隔字段：domain / subdomains / path / secure / expiry / name / value\n"
+    "# Managed by TokBrain. Uploading again replaces this file.\n"
+    "# Keep 7 tab-separated fields: domain / subdomains / path / secure / expiry / name / value\n"
 )
 
 

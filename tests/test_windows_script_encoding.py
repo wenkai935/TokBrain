@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_windows_powershell_scripts_use_utf8_bom():
     scripts = (
-        ROOT / "start.ps1",
+        ROOT / "launchers" / "start.ps1",
         ROOT / "scripts" / "setup.ps1",
         ROOT / "scripts" / "stop.ps1",
         ROOT / "scripts" / "prepublish_check.ps1",
@@ -17,7 +17,7 @@ def test_windows_powershell_scripts_use_utf8_bom():
 
 
 def test_single_entry_launcher_is_a_thin_wrapper_around_the_menu():
-    launcher = (ROOT / "TokBrain.cmd").read_text(encoding="utf-8")
+    launcher = (ROOT / "TokBrain启动器.cmd").read_text(encoding="utf-8")
     assert r"scripts\menu.ps1" in launcher
     assert "-ExecutionPolicy Bypass" in launcher
     # Arguments must reach the script so `TokBrain.cmd status` works headlessly.
@@ -31,11 +31,14 @@ def test_single_entry_launcher_is_a_thin_wrapper_around_the_menu():
     assert r'scripts\setup.ps1' in menu
     assert r'scripts\stop.ps1' in menu
     assert "start.ps1" in menu
+    assert "function Test-PythonReady" in menu
+    assert "exit $LASTEXITCODE" in menu
+    assert "exit 0" not in menu
 
 
 def test_setup_launcher_uses_process_scoped_execution_policy_bypass():
-    launcher = (ROOT / "setup.cmd").read_text(encoding="utf-8").lower()
-    localized_launcher = (ROOT / "安装.cmd").read_text(encoding="utf-8").lower()
+    launcher = (ROOT / "launchers" / "setup.cmd").read_text(encoding="utf-8").lower()
+    localized_launcher = (ROOT / "launchers" / "安装.cmd").read_text(encoding="utf-8").lower()
     assert "powershell.exe" in launcher
     assert "-executionpolicy bypass" in launcher
     assert r"scripts\setup.ps1" in launcher
@@ -60,17 +63,33 @@ def test_setup_checks_node_before_installing_project_dependencies():
     assert node_check < pip_install
 
 
+def test_setup_installs_frontend_before_the_python_environment():
+    setup = (ROOT / "scripts" / "setup.ps1").read_text(encoding="utf-8")
+    npm_install = setup.index("ci --cache $NpmCachePath")
+    pip_install = setup.index("-m pip install --upgrade pip")
+    assert npm_install < pip_install
+
+
+def test_setup_installs_the_project_lark_cli():
+    setup = (ROOT / "scripts" / "setup.ps1").read_text(encoding="utf-8")
+    menu = (ROOT / "scripts" / "menu.ps1").read_text(encoding="utf-8-sig")
+    assert 'Join-Path $WorkspacePath "cli"' in setup
+    assert "cli\\node_modules\\@larksuite\\cli\\bin\\lark-cli.exe" in setup
+    assert "function Test-LarkCliReady" in menu
+    assert '"项目内"' in menu
+
+
 def test_setup_overrides_inaccessible_global_npm_cache():
     setup = (ROOT / "scripts" / "setup.ps1").read_text(encoding="utf-8")
     assert '$env:LOCALAPPDATA' in setup
     assert '"TokBrain\\npm-cache"' in setup
     assert "ci --cache $NpmCachePath" in setup
     assert "without modifying the user's global npm config" in setup
-    assert "如果仍出现 EPERM" in setup
+    assert "package.json 与 package-lock.json 不同步" in setup
 
 
 def test_startup_reads_the_api_contract_from_the_backend_instead_of_hardcoding_it():
-    startup = (ROOT / "start.ps1").read_text(encoding="utf-8-sig")
+    startup = (ROOT / "launchers" / "start.ps1").read_text(encoding="utf-8-sig")
     assert "from app.main import API_CONTRACT_VERSION" in startup
     assert "$ExpectedApiContract" in startup
     assert "$RuntimeProbeScript | & $BackendPython -" in startup
@@ -81,9 +100,9 @@ def test_startup_reads_the_api_contract_from_the_backend_instead_of_hardcoding_i
 
 
 def test_start_stop_and_restart_share_runtime_state_recovery():
-    startup = (ROOT / "start.ps1").read_text(encoding="utf-8-sig")
+    startup = (ROOT / "launchers" / "start.ps1").read_text(encoding="utf-8-sig")
     stop = (ROOT / "scripts" / "stop.ps1").read_text(encoding="utf-8-sig")
-    restart = (ROOT / "重启.cmd").read_text(encoding="utf-8").lower()
+    restart = (ROOT / "launchers" / "重启.cmd").read_text(encoding="utf-8").lower()
 
     assert "function Repair-StaleRuntimeState" in startup
     assert "Repair-StaleRuntimeState -CurrentBackendPort" in startup

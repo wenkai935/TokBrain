@@ -19,9 +19,11 @@ import { didAnyJobReachTerminal, operationIncludesJob } from "../lib/jobPolling.
 import { mergeWorksPage } from "../lib/libraryPagination.ts";
 
 const pageShell = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+const importWorkspaceComponent = await readFile(new URL("../components/ImportWorkspace.tsx", import.meta.url), "utf8");
+const parseWorkspaceComponent = await readFile(new URL("../components/ParseWorkspace.tsx", import.meta.url), "utf8");
 const libraryComponent = await readFile(new URL("../components/Library.tsx", import.meta.url), "utf8");
 const settingsComponent = await readFile(new URL("../components/Settings.tsx", import.meta.url), "utf8");
-const page = [pageShell, libraryComponent, settingsComponent].join("\n");
+const page = [pageShell, importWorkspaceComponent, libraryComponent, settingsComponent].join("\n");
 const api = await readFile(new URL("../lib/api.ts", import.meta.url), "utf8");
 const contracts = await readFile(new URL("../lib/contracts.ts", import.meta.url), "utf8");
 const libraryReturn = await readFile(new URL("../lib/libraryReturn.ts", import.meta.url), "utf8");
@@ -96,8 +98,6 @@ test("layout imports all theme styles directly for Windows non-ASCII paths", asy
 
 test("risk notice uses semantic danger tokens in light and dark themes", () => {
   assert.match(page, /className="risk-notice" role="alert"/);
-  assert.match(page, /仅当平台明确返回作者允许下载时才处理完整视频/);
-  assert.match(page, /作者未允许下载 · 仅字幕\/音频/);
   for (const token of ["--danger-text", "--danger-border", "--danger-surface"]) {
     assert.match(styles, new RegExp(token));
     assert.match(themeBaseStyles, new RegExp(token));
@@ -108,106 +108,30 @@ test("risk notice uses semantic danger tokens in light and dark themes", () => {
   assert.match(styles, /\.risk-notice\s*\{[^}]*overflow-wrap:anywhere/s);
 });
 
-test("batch input, progress, three workers, cancellation, and confirmation are visible", () => {
-  assert.match(page, /className="import-textarea"/);
-  assert.match(page, /每行粘贴一个抖音作品链接/);
-  assert.match(page, /className="batch-progress"/);
-  assert.match(page, /className="batch-stats"/);
-  assert.match(page, /className="worker-grid"/);
-  assert.match(page, /中断解析/);
-  assert.match(page, /正在安全停止/);
-  assert.match(page, /确认加入待入库/);
-  assert.match(page, /confirmedWorkIds/);
-  assert.match(page, /confirmedIds\.push\(\.\.\.result\.work_ids\)/);
-  assert.match(page, /api\.ingest\(workIds\)/);
-  assert.match(page, /入库（\$\{confirmedWorkIds\.length\}）/);
-  assert.match(page, /已勾选待确认/);
-  assert.match(page, /已确认待入库/);
-  assert.match(page, /新勾选作品需先确认；已确认作品可直接入库，两组操作互不影响/);
-  assert.match(page, /samePreviewWork/);
-  assert.match(page, /selectedVisibleIds/);
-  assert.match(page, /确认加入待入库（\$\{selectedVisibleIds\.length\}）/);
-  assert.match(page, /加入收藏夹/);
-  assert.match(page, /manual-import/);
+test("network import collects previews and syncs only selected works", () => {
+  assert.match(importWorkspaceComponent, /key: "douyin", label: "抖音"/);
+  assert.match(importWorkspaceComponent, /api\.domCollect\(scope\)/);
+  assert.match(importWorkspaceComponent, /api\.domCollectStatus\(taskId\)/);
+  assert.match(importWorkspaceComponent, /api\.collectedVideos\(scope\)/);
+  assert.match(importWorkspaceComponent, /api\.syncSelected\(scope, ids\)/);
+  assert.match(importWorkspaceComponent, /勾选视频后点「同步当前 N 条」才入库/);
 });
 
-test("Douyin links are restored to manual preview and confirmation", () => {
-  assert.match(page, /添加抖音作品链接/);
-  assert.match(page, /预检后由您确认/);
-  assert.match(page, /只进行预检，不会自动入库/);
-  assert.match(page, /开始预检/);
-  assert.match(page, /createImportBatch\(\{ text: submittedText \}\)/);
-  assert.doesNotMatch(page, /setLinkDefaultCollectionId/);
-  assert.doesNotMatch(page, /auto_confirm: true/);
-  assert.doesNotMatch(page, /start_processing: linkStartProcessing/);
-  assert.doesNotMatch(contracts, /automation\?: \{/);
-  assert.match(contracts, /export type ImportBatchCreateRequest = \{\s*text: string;\s*\}/);
+test("parse workspace separates queue states and protects resolving items", () => {
+  for (const label of ["等待中", "排队中", "解析中", "可确认"]) {
+    assert.match(parseWorkspaceComponent, new RegExp(`label: "${label}"`));
+  }
+  assert.match(parseWorkspaceComponent, /NON_SELECTABLE_STATES = new Set\(\["resolving"\]\)/);
+  assert.match(parseWorkspaceComponent, /disabled=\{count === 0 \|\| !group\.selectable\}/);
+  assert.match(parseWorkspaceComponent, /删除所选项（\{deletableSelected\.length\}）/);
+  assert.match(parseWorkspaceComponent, /重试所选项（\{retryableSelected\.length\}）/);
 });
 
-test("folder and ZIP packages upload, recover, and enter the normal confirm flow", () => {
-  assert.match(page, /导入外部视频数据包/);
-  assert.match(page, /选择文件夹/);
-  assert.match(page, /选择 ZIP/);
-  assert.match(page, /douyin_videos\.db/);
-  assert.match(page, /Promise\.all\(\[worker\(\), worker\(\)\]\)/);
-  assert.match(page, /api\.createPackageImportBatch/);
-  assert.match(page, /api\.uploadPackageImportFile/);
-  assert.match(page, /api\.analyzePackageImportBatch/);
-  assert.match(page, /storedPackageBatches/);
-  assert.match(page, /切换页面或关闭浏览器不会中断后端检测/);
-  assert.match(api, /\/api\/package-import-batches/);
-  assert.match(contracts, /"package_upload"/);
-  assert.match(page, /const \[rightsAttested, setRightsAttested\] = useState\(false\)/);
-  assert.match(page, /setRightsAttested=\{changeRightsAttestation\}/);
-  assert.match(page, /rightsAttested=\{rightsAttested\}/);
-  assert.match(page, /rights_attested: true/);
-});
-
-test("batch polling is bounded and stops at terminal states", () => {
-  assert.match(page, /TERMINAL_BATCH_STATES/);
-  assert.match(page, /window\.setTimeout\(async \(\) =>/);
-  assert.match(page, /api\.importBatch\(batch\.id\)/);
-  assert.doesNotMatch(page, /setInterval\(/);
-});
-
-test("starting a new preview retains prior confirmable results and clears only successful input", () => {
-  assert.match(page, /const \[retainedBatches, setRetainedBatches\]/);
-  assert.match(page, /RETAINED_IMPORT_STATUSES\.has\(item\.status\)/);
-  assert.match(page, /setRetainedBatches\(\(current\) =>/);
-  assert.match(page, /submittedImportTexts/);
-  assert.match(page, /fullySuccessful/);
-  assert.match(page, /setImportText\(\(current\) => current\.trim\(\) === submitted\.trim\(\) \? "" : current\)/);
-  assert.doesNotMatch(
-    page,
-    /if \(tab === "import"\) return;\s*setRetainedBatches\(\[\]\)/,
-  );
-});
-
-test("duplicate links are removed automatically while unique works continue previewing", () => {
-  assert.match(contracts, /queued_count: number/);
-  assert.match(contracts, /duplicate_count: number/);
-  assert.match(page, /const duplicateOnly =/);
-  assert.match(page, /已去掉 \$\{created\.duplicate_count\} 条重复链接/);
-  assert.match(page, /没有新的作品需要预检/);
-  assert.match(page, /\$\{created\.queued_count\} 个不同作品已进入预检/);
-  assert.match(page, /Number\(next\.progress\.duplicates \|\| 0\)/);
-  assert.match(
-    page,
-    /!\(item\.status === "duplicate" && item\.error_code === "duplicate_input"\)/,
-  );
-});
-
-test("result rows expose stable errors, upload fallback, and long-text wrapping", () => {
-  assert.match(page, /item\.error_code && <code>/);
-  assert.match(page, /item\.error_message/);
-  assert.match(page, /item\.error_code === "duplicate_input" \? "预检重复" : "已在知识库"/);
-  assert.match(page, /上传本地补件/);
-  assert.match(page, /删除预检结果/);
-  assert.match(page, /removePreviewItem/);
-  assert.match(api, /removeImportItem/);
-  assert.match(page, /\.mp4,.mov,.mkv,.webm/);
-  assert.match(styles, /\.result-body h3\s*\{[^}]*overflow-wrap:anywhere/s);
-  assert.match(styles, /\.result-body p\s*\{[^}]*overflow-wrap:anywhere/s);
+test("import progress clears successful jobs and can restore hidden failures", () => {
+  assert.match(importWorkspaceComponent, /SUCCESS_JOB_STATES = new Set\(\["succeeded", "partial"\]\)/);
+  assert.match(importWorkspaceComponent, /api\.clearCompletedJobs\(\)/);
+  assert.match(importWorkspaceComponent, /清除已完成（\{completedCount\}）/);
+  assert.match(importWorkspaceComponent, /恢复非成功项目（\{dismissed\.size\}）/);
 });
 
 test("small screens collapse worker, result, and safety layouts", () => {
@@ -231,22 +155,21 @@ test("API client exposes import, local assets, and unified jobs", () => {
 });
 
 test("removed collection automation and account entry points are absent", () => {
-  assert.doesNotMatch(page, /refreshCollections/);
-  assert.doesNotMatch(page, /api\.sync/);
+  assert.doesNotMatch(importWorkspaceComponent, /refreshCollections/);
   assert.doesNotMatch(page, /继续初始化/);
   assert.doesNotMatch(page, /完整核对/);
   assert.doesNotMatch(api, /\/api\/auth\//);
   assert.doesNotMatch(api, /adapter-health/);
 });
 
-test("settings show fixed read-only safety values and local health", () => {
-  assert.match(page, /可选解析 Cookie/);
+test("settings show current models, encrypted credentials, and local health", () => {
+  assert.match(page, /百炼模型 API Key/);
+  assert.match(page, /账单 AccessKey ID/);
+  assert.match(page, /settings\.processing_model_options\.map/);
+  assert.match(page, /name="asr_model_readonly"/);
   assert.doesNotMatch(page, /settings\.import_worker_count/);
   assert.doesNotMatch(page, /settings\.import_network_concurrency/);
   assert.doesNotMatch(page, /settings\.import_cooldown_min_seconds/);
-  assert.match(page, /saveF2Cookie/);
-  assert.match(page, /保存 Cookie/);
-  assert.match(page, /已保存并生效/);
   assert.match(page, /className="health-progress"/);
   assert.match(page, /api\.healthProbe/);
   assert.match(page, /敏感残留尚未清理/);
@@ -254,16 +177,9 @@ test("settings show fixed read-only safety values and local health", () => {
   assert.doesNotMatch(page, /name="import_daily_limit"/);
 });
 
-test("settings expose the editable summary prompt and default reset", () => {
-  assert.match(page, /视频 AI 总结提示词/);
-  assert.match(page, /settings\.summary_prompt/);
-  assert.match(page, /settings\.default_summary_prompt/);
-  assert.match(page, /一键恢复默认提示词/);
-  assert.match(page, /saveSummaryPrompt/);
-  assert.match(page, /视频\/图文总结模型/);
+test("settings expose processing, usage, and billing controls", () => {
+  assert.match(page, /视频图文总结模型/);
   assert.match(page, /settings\.processing_model_options\.map/);
-  assert.match(page, /qwen-math-turbo/);
-  assert.match(page, /固定专用模型/);
   assert.match(page, /刷新官方账单/);
   assert.match(page, /账单查询 AccessKey ID/);
   assert.match(page, /saveBillingCredentials/);
@@ -275,33 +191,16 @@ test("settings expose the editable summary prompt and default reset", () => {
   assert.match(api, /\/api\/settings\/secrets/);
 });
 
-test("import overview and processing queue keep all active tasks visible", () => {
-  assert.match(page, /className="import-overview"/);
-  for (const label of ["今日处理", "今日 AI 用量", "已入库", "待入库"]) {
-    assert.match(page, new RegExp(label));
-  }
-  assert.match(page, /今日处理[\s\S]{0,120}daily_works_used/);
-  assert.doesNotMatch(page, /今日处理[\s\S]{0,120}daily_links_used/);
-  assert.match(page, /今日入库剩余[\s\S]{0,120}dailyIngestRemaining/);
-  assert.match(page, /dailyIngestRemaining[\s\S]{0,180}daily_works_used/);
-  assert.doesNotMatch(page, /今日剩余[\s\S]{0,120}batch\.remaining_daily/);
-  assert.match(page, /const activeJobs = jobs/);
-  assert.match(page, /activeJobs\.map/);
-  assert.match(page, /队列第/);
-});
-
-test("local video import supports bounded two-worker uploads and refresh recovery", () => {
-  assert.match(page, /导入已经下载好的视频/);
+test("local video import keeps upload limits, recovery, and rights attestation", () => {
   assert.match(page, /const LOCAL_VIDEO_LIMIT = 10/);
-  assert.match(page, /multiple\s+accept="\.mp4,\.mov,\.mkv,\.webm/);
-  assert.match(page, /await Promise\.all\(\[worker\(\), worker\(\)\]\)/);
+  assert.match(page, /multiple[\s\S]{0,120}accept="\.mp4,\.mov,\.mkv,\.webm/);
   assert.match(page, /rights_attested: true/);
   assert.match(page, /rememberLocalImportBatch\(created\.id\)/);
   assert.match(batchStorage, /LOCAL_IMPORT_BATCH_STORAGE_KEY/);
   assert.match(page, /已恢复刷新前的导入批次/);
-  assert.match(page, /owner\.source_type === "local_upload"/);
+  assert.match(libraryComponent, /value: "local_upload"/);
   assert.match(api, /\/api\/local-import-batches/);
-  assert.match(api, /\/api\/import-items\/\$\{itemId\}/);
+  assert.match(api, /\/api\/local-import-batches\/\$\{encodeURIComponent\(batchId\)\}\/items\/\$\{itemId\}\/video/);
 });
 
 test("local video consent and preflight survive navigation within the browser tab", () => {
@@ -312,12 +211,11 @@ test("local video consent and preflight survive navigation within the browser ta
   assert.match(page, /<section className="import-workspace stack" hidden=\{hidden\}>/);
 });
 
-test("settings manage one-time external import tokens", () => {
-  assert.match(page, /外部导入令牌/);
-  assert.match(page, /明文仅在生成或轮换后显示一次/);
-  assert.match(page, /createIntegrationToken/);
-  assert.match(page, /revokeIntegrationToken/);
-  assert.match(api, /\/api\/settings\/integration-token/);
+test("removed external import token controls stay absent", () => {
+  assert.doesNotMatch(page, /外部导入令牌/);
+  assert.doesNotMatch(page, /createIntegrationToken/);
+  assert.doesNotMatch(page, /revokeIntegrationToken/);
+  assert.doesNotMatch(api, /\/api\/settings\/integration-token/);
 });
 
 test("pending and in-library works can share local collections", () => {
@@ -428,6 +326,10 @@ test("critical API contract guards reject malformed local responses", () => {
     default_summary_prompt: "默认",
     processing_model: "processing",
     processing_model_options: [],
+    chat_fast_model: "fast",
+    chat_deep_model: "deep",
+    chat_model_options: [],
+    default_answer_format: "markdown",
     ocr_model: "ocr",
     asr_model: "asr",
     embedding_model: "embedding",
@@ -512,7 +414,7 @@ test("library keeps primary states plus supplement view, summaries, lazy covers,
 });
 
 test("supplement view explains material gaps and uploads complete local media", () => {
-  assert.match(page, /待补件 <em>\{summary\.supplement_count \?\? 0\}<\/em>/);
+  assert.match(page, /待补件 <span className="n">\{summary\.supplement_count \?\? 0\}<\/span>/);
   assert.match(page, /<strong>材料缺口：<\/strong>\{supplementReasonLabel\(work\.supplement_reason\)\}/);
   assert.match(page, /work\.evidence_state === "sufficient" \? "现有材料可检索"/);
   assert.match(page, /full_video_unavailable: "未取得完整视频文件；已有总结可能来自字幕、音频或部分画面"/);
@@ -528,7 +430,6 @@ test("supplement view explains material gaps and uploads complete local media", 
   assert.match(page, /work\.kind === "image"\s*\? "上传完整图片组"\s*:\s*"上传完整视频"/s);
   assert.match(page, /api\.uploadWorkSupplement\(work\.id, selectedFiles\)/);
   assert.match(page, /我确认有权处理并上传这些本地素材/);
-  assert.match(page, /无论下载权限状态如何都会尝试取得并处理全部公开图片/);
   assert.match(api, /state: "pending" \| "in_library" \| "supplement" \| "issues" \| "archived"/);
   assert.match(api, /body\.append\("rights_attested", "true"\)/);
   assert.match(api, /body\.append\("files", file, file\.name\)/);

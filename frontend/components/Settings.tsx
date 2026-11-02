@@ -92,20 +92,7 @@ function healthFromProbes(probes: Health["probes"]): Health {
 }
 
 function modelOptionLabel(model: string) {
-  const notes: Record<string, string> = {
-    "qwen3.6-flash": "低成本默认",
-    "qwen3.7-flash": "新一代轻量",
-    "qwen3.7-plus": "能力与成本均衡",
-    "qwen3.7-max": "高能力",
-    "qwen-math-turbo": "数学专项，仅建议用于对话",
-    "deepseek-r1-distill-qwen-7b": "推理蒸馏",
-    "deepseek-v4-flash": "第三方轻量",
-    "deepseek-v4-pro": "第三方高能力",
-    "glm-5": "第三方推理",
-    "glm-5.1": "第三方推理",
-    "glm-5.2": "第三方推理",
-  };
-  return notes[model] ? `${model}（${notes[model]}）` : model;
+  return `${model}（百炼）`;
 }
 
 const PROVIDER_LABELS: Record<ModelProviderType, string> = {
@@ -356,13 +343,15 @@ export function Settings({
   const [billingAccessKeyIdDraft, setBillingAccessKeyIdDraft] = useState("");
   const [billingAccessKeySecretDraft, setBillingAccessKeySecretDraft] = useState("");
   const [dashscopeApiKeyDraft, setDashscopeApiKeyDraft] = useState("");
+  const [dailyTokensDraft, setDailyTokensDraft] = useState(() => formatWan(settings.daily_llm_token_limit));
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const numeric = ["daily_media_minutes_limit", "daily_llm_token_limit", "monthly_warning_cny", "scene_threshold", "max_scene_candidates", "max_keyframes", "min_keyframe_gap_seconds"] as const;
+    const numeric = ["daily_media_minutes_limit", "monthly_warning_cny", "scene_threshold", "max_scene_candidates", "max_keyframes", "min_keyframe_gap_seconds"] as const;
     const body: RuntimeSettingsUpdate = {};
     numeric.forEach((name) => body[name] = Number(form.get(name)));
+    body.daily_llm_token_limit = Number(dailyTokensDraft.replace(/,/g, ""));
     body.processing_model = String(form.get("processing_model") || "");
     await perform("settings", () => api.saveSettings(body), "设置已保存");
   }
@@ -377,9 +366,10 @@ export function Settings({
 
   async function saveFeeSettings() {
     const form = new FormData(document.querySelector<HTMLFormElement>("form.stack")!);
-    const names = ["daily_media_minutes_limit", "monthly_warning_cny", "daily_llm_token_limit"] as const;
+    const names = ["daily_media_minutes_limit", "monthly_warning_cny"] as const;
     const body: RuntimeSettingsUpdate = {};
     names.forEach((name) => { body[name] = Number(form.get(name)); });
+    body.daily_llm_token_limit = Number(dailyTokensDraft.replace(/,/g, ""));
     await perform("fee-settings", () => api.saveSettings(body), "费用设置已保存");
   }
 
@@ -463,7 +453,7 @@ export function Settings({
       <form className="stack" onSubmit={save}>
         <ThemePicker />
         {settings.security_cleanup_required && (
-          <section className="risk-notice"><strong>敏感残留尚未清理</strong><p>{settings.security_cleanup_message}</p></section>
+          <section className="risk-notice" role="alert"><strong>敏感残留尚未清理</strong><p>{settings.security_cleanup_message}</p></section>
         )}
         <section className="card health-card">
           <div className="section-head">
@@ -503,10 +493,13 @@ export function Settings({
           <div className="subhead standalone"><span>当前模型</span></div>
           <ModelProfileManager perform={perform}>
           <div className="form-grid">
-            <div className="field model-readonly">
+            <label className="field">
               <span>语音转写模型</span>
-              <p>{settings.asr_model}（百炼）</p>
-            </div>
+              <select name="asr_model_readonly" defaultValue={settings.asr_model} disabled>
+                <option value={settings.asr_model}>{settings.asr_model}（百炼）</option>
+              </select>
+              <small>&nbsp;</small>
+            </label>
             <label className="field">
               <span>视频图文总结模型</span>
               <select name="processing_model" defaultValue={settings.processing_model}>
@@ -529,11 +522,15 @@ export function Settings({
                 />
                 <button
                   type="button"
-                  className="secondary"
+                  className={settings.has_dashscope_key && !dashscopeApiKeyDraft.trim() ? "secondary saved" : "secondary"}
                   disabled={!dashscopeApiKeyDraft.trim() || busy === "dashscope-key"}
                   onClick={saveDashscopeKey}
                 >
-                  {busy === "dashscope-key" ? "保存中…" : "保存"}
+                  {busy === "dashscope-key"
+                    ? "保存中…"
+                    : settings.has_dashscope_key && !dashscopeApiKeyDraft.trim()
+                      ? "已保存"
+                      : "保存"}
                 </button>
               </div>
             </label>
@@ -608,8 +605,13 @@ export function Settings({
             <label className="field wide">
               <span>每日调用 tokens</span>
               <div className="field-control">
-                <input name="daily_llm_token_limit" type="number" defaultValue={settings.daily_llm_token_limit} min={1000} />
-                <small className="wan-hint">{formatWan(settings.daily_llm_token_limit)}（万进制）</small>
+                <input
+                  name="daily_llm_token_limit"
+                  type="text"
+                  inputMode="numeric"
+                  value={dailyTokensDraft}
+                  onChange={(event) => setDailyTokensDraft(formatTokensInput(event.target.value))}
+                />
               </div>
             </label>
             <div className="button-row group-save">
@@ -679,6 +681,11 @@ export function Settings({
 
 function formatWan(value: number): string {
   return String(Math.trunc(value)).replace(/\B(?=(\d{4})+(?!\d))/g, ",");
+}
+
+function formatTokensInput(raw: string): string {
+  const digits = raw.replace(/\D/g, "");
+  return digits.replace(/\B(?=(\d{4})+(?!\d))/g, ",");
 }
 
 function Field({ name, label, value, min, max, step = "1" }: { name: string; label: string; value: number; min: number; max?: number; step?: string }) {

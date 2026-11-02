@@ -202,7 +202,10 @@ export default function Home() {
   const libraryLoadingRef = useRef(false);
   const worksPageLengthRef = useRef(worksPage.items.length);
   const activeOperationRef = useRef("");
-  worksPageLengthRef.current = worksPage.items.length;
+
+  useEffect(() => {
+    worksPageLengthRef.current = worksPage.items.length;
+  }, [worksPage.items.length]);
 
   useEffect(() => {
     batchRef.current = batch;
@@ -1115,8 +1118,8 @@ export default function Home() {
                 </button>
                 <button
                   className="secondary"
-                  disabled={discovery.total < 3}
-                  title={discovery.total < 3 ? "少于 3 条时无需展开，直接解析即可" : undefined}
+                  disabled={discovery.total < 3 && !discovery.unresolved}
+                  title={discovery.total < 3 && !discovery.unresolved ? "少于 3 条时无需展开，直接解析即可" : undefined}
                   onClick={() => setDiscoveryOpen((open) => !open)}
                 >
                   {discoveryOpen ? "收起清单" : "查看清单"}
@@ -1226,7 +1229,6 @@ export default function Home() {
           onEdit={editPreviewItem}
           onBatchDelete={batchRemovePreviewItems}
           onBatchRetry={batchRetryPreviewItems}
-          settings={settings}
           collections={collections}
         />
         {tab === "library" && (
