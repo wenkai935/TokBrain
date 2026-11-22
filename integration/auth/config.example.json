@@ -1,0 +1,147 @@
+{
+  "_说明": "xiaoqi-auth 全局服务注册表。client=调用方身份，aud=可访问的资源，scope=可在该资源上做的动作。原则：最小权限，一个 client 只拿它实际需要的 aud/scope。真实 secret 由 gen_config.py 随机生成，不入库。",
+  "_audience_清单": {
+    "music-bridge": "音乐桥 :4400 —— 点歌/控制/查询",
+    "ha-proxy": "HA 反向代理 :8124 —— 灯/插座/空调/只读查询，经反代注入 HA token",
+    "xiaozhi-gateway": "小智服务端 :8642 —— Hermes LLM provider 调用",
+    "command-exec": "命令执行代理 —— pc_control / run_shell（阶段2，高风险）",
+    "file-service": "文件服务 —— 白名单读写/发送到手机（阶段2）",
+    "tokbrain-control": "TokBrain 控制面（Windows :8011）—— 知识入库/确认/查询；只读检索走 NAS stdio MCP，不在此 aud"
+  },
+  "_scope_清单": {
+    "music:play": "点歌",
+    "music:control": "暂停/下一首/曲库重建",
+    "music:read": "查状态与曲库",
+    "ha:light:write": "控制灯",
+    "ha:switch:write": "控制插座/制冰机",
+    "ha:climate:write": "控制空调",
+    "ha:read": "读设备状态与活动历史",
+    "ha:presence": "查在家位置",
+    "voice:announce": "播报",
+    "file:read": "白名单读",
+    "file:send": "发文件到手机",
+    "exec:pc": "在 Windows PC 执行命令",
+    "exec:shell": "在音箱执行 shell（最高风险）",
+    "kb:read": "查询知识库状态/待确认队列（只读）",
+    "kb:ingest": "确认入库/重投/导入（花钱+撞风控，需人工闸）"
+  },
+  "issuer": "xiaoqi-auth",
+  "token_ttl_seconds": 900,
+  "audit_path": "/vol1/1000/xiaoqi-auth/audit.jsonl",
+  "clients": {
+    "hermes-voice": {
+      "_desc": "语音链路 provider（小智→Hermes），当前音乐闭环已接",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_1",
+      "scopes": [
+        "music:play",
+        "music:control",
+        "music:read"
+      ],
+      "auds": [
+        "music-bridge"
+      ]
+    },
+    "hermes-home": {
+      "_desc": "Hermes home MCP（device_set 等）+ 音乐工具，微信/网页/语音共用",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_2",
+      "scopes": [
+        "music:play",
+        "music:control",
+        "music:read",
+        "ha:light:write",
+        "ha:switch:write",
+        "ha:climate:write",
+        "ha:read",
+        "ha:presence",
+        "voice:announce",
+        "ha:media:write",
+        "ha:notify:write"
+      ],
+      "auds": [
+        "music-bridge",
+        "ha-proxy"
+      ]
+    },
+    "home-rules": {
+      "_desc": "场景联动 MCP：只写设备，不读敏感历史",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_3",
+      "scopes": [
+        "ha:light:write",
+        "ha:switch:write",
+        "ha:climate:write"
+      ],
+      "auds": [
+        "ha-proxy"
+      ]
+    },
+    "home-history": {
+      "_desc": "历史 MCP：只读",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_4",
+      "scopes": [
+        "ha:read"
+      ],
+      "auds": [
+        "ha-proxy"
+      ]
+    },
+    "life-agent": {
+      "_desc": "life.py 与 systemd timer（life-nightly/health-probe）：播报 + 只读健康",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_5",
+      "scopes": [
+        "voice:announce",
+        "ha:read",
+        "ha:presence",
+        "ha:media:write",
+        "ha:notify:write"
+      ],
+      "auds": [
+        "ha-proxy",
+        "xiaozhi-gateway"
+      ]
+    },
+    "file-bridge": {
+      "_desc": "文件能力（nas_file_*）：白名单读写与发送，阶段2接",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_6",
+      "scopes": [
+        "file:read",
+        "file:send"
+      ],
+      "auds": [
+        "file-service"
+      ]
+    },
+    "pc-bridge": {
+      "_desc": "pc_control MCP：在 Windows PC 执行命令，阶段2接，高风险",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_7",
+      "scopes": [
+        "exec:pc"
+      ],
+      "auds": [
+        "command-exec"
+      ]
+    },
+    "scripts-runner": {
+      "_desc": "部署/运维脚本与 promo-video 批处理：本地执行，阶段2按需",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_8",
+      "scopes": [
+        "exec:shell",
+        "file:read"
+      ],
+      "auds": [
+        "command-exec",
+        "file-service"
+      ]
+    },
+    "hermes-knowledge": {
+      "_desc": "Hermes 知识能力：查队列走 kb:read，确认入库走 kb:ingest（人工闸后）。只读问答走 NAS stdio MCP，不需要票据",
+      "secret": "REPLACE_WITH_RANDOM_SECRET_9",
+      "scopes": [
+        "kb:read",
+        "kb:ingest"
+      ],
+      "auds": [
+        "tokbrain-control"
+      ]
+    }
+  }
+}

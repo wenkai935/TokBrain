@@ -1,0 +1,626 @@
+# 小智服务端配置样例（脱敏版）
+# 这是 xiaozhi-esp32-server 的标准配置结构，真实凭据全部为占位符。
+# 部署时复制为 data/.config.yaml 并填入你自己的 key / 地址；切勿把填好的文件提交到 git。
+# 原项目：xiaozhi-esp32-server；本样例仅保留小七家庭使用时的字段结构。
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  websocket: ws://你的ip或者域名:端口号/xiaozhi/v1/
+  vision_explain: http://192.168.1.10:8003/mcp/vision/explain
+  timezone_offset: 8
+  auth:
+    enabled: false
+    allowed_devices: []
+  mqtt_gateway: null
+  mqtt_signature_key: null
+  udp_gateway: null
+log:
+  log_format: <green>{time:YYMMDD HH:mm:ss}</green>[{version}_{selected_module}][<light-blue>{extra[tag]}</light-blue>]-<level>{level}</level>-<light-green>{message}</light-green>
+  log_format_file: '{time:YYYY-MM-DD HH:mm:ss} - {version}_{selected_module} - {name}
+    - {level} - {extra[tag]} - {message}'
+  log_level: INFO
+  log_dir: tmp
+  log_file: server.log
+  data_dir: data
+delete_audio: true
+close_connection_no_voice_time: 120
+tts_timeout: 15
+tool_call_timeout: 30
+enable_wakeup_words_response_cache: true
+enable_greeting: true
+enable_stop_tts_notify: false
+stop_tts_notify_voice: config/assets/tts_notify.mp3
+enable_websocket_ping: false
+tts_audio_send_delay: 0
+exit_commands:
+- 退出
+- 关闭
+xiaozhi:
+  type: hello
+  version: 1
+  transport: websocket
+  audio_params:
+    format: opus
+    sample_rate: 24000
+    channels: 1
+    frame_duration: 60
+module_test:
+  test_sentences:
+  - 你好，请介绍一下你自己
+  - What's the weather like today?
+  - 请用100字概括量子计算的基本原理和应用前景
+wakeup_words:
+- 你好小智
+- 嘿你好呀
+- 你好小志
+- 小爱同学
+- 你好小鑫
+- 你好小新
+- 小美同学
+- 小龙小龙
+- 喵喵同学
+- 小滨小滨
+- 小冰小冰
+mcp_endpoint: 你的接入点 websocket地址
+context_providers:
+- url: ''
+  headers:
+    Authorization: ''
+plugins:
+  get_weather:
+    api_host: 你的和风天气api_host.re.qweatherapi.com
+    api_key: 你的和风天气api_key
+    default_location: 广州
+  get_news_from_chinanews:
+    default_rss_url: https://www.chinanews.com.cn/rss/society.xml
+    society_rss_url: https://www.chinanews.com.cn/rss/society.xml
+    world_rss_url: https://www.chinanews.com.cn/rss/world.xml
+    finance_rss_url: https://www.chinanews.com.cn/rss/finance.xml
+  get_news_from_newsnow:
+    url: https://newsnow.busiyi.world/api/s?id=
+    news_sources: 澎湃新闻;百度热搜;财联社
+  home_assistant:
+    devices:
+    - 客厅,玩具灯,switch.your_device_1
+    - 卧室,台灯,switch.your_device_2
+    base_url: http://homeassistant.local:8123
+    api_key: 你的home assistant api访问令牌
+  play_music:
+    music_dir: ./music
+    music_ext:
+    - .mp3
+    - .wav
+    - .p3
+    refresh_time: 300
+  search_from_ragflow:
+    description: 当用户问xxx时，调用本方法，使用知识库中的信息回答问题
+    base_url: http://192.168.1.12
+    api_key: ragflow-xxx
+    dataset_ids:
+    - '123456789'
+  web_search:
+    provider: metaso
+    description: 联网搜索工具。当用户明确需要联网搜索问题时使用此工具。
+    max_results: 5
+    api_key: mk-xxx
+voiceprint: {}
+prompt: 你是放在家里的智能音箱助手。回答口语化、简短，一般不超过两句话。需要操作设备或查询状态时，直接给结论，不要复述过程。
+prompt_template: agent-base-prompt.txt
+system_error_response: 主人，小智现在有点忙，我们稍后再试吧。
+end_prompt:
+  enable: true
+  prompt: '请你以"时间过得真快"未来头，用富有感情、依依不舍的话来结束这场对话吧！
+
+    '
+selected_module:
+  VAD: SileroVAD
+  ASR: FunASR
+  LLM: HermesLLM
+  VLLM: ChatGLMVLLM
+  TTS: NativeText
+  Memory: nomem
+  Intent: nointent
+Intent:
+  nointent:
+    type: nointent
+  intent_llm:
+    type: intent_llm
+    llm: ChatGLMLLM
+    functions:
+    - web_search
+    - get_weather
+    - get_news_from_newsnow
+    - play_music
+  function_call:
+    type: function_call
+    functions:
+    - change_role
+    - web_search
+    - get_weather
+    - get_news_from_newsnow
+    - play_music
+Memory:
+  mem0ai:
+    type: mem0ai
+    api_key: 你的mem0ai api key
+  powermem:
+    type: powermem
+    enable_user_profile: true
+    llm:
+      provider: openai
+      config:
+        api_key: 你的LLM API密钥
+        model: qwen-plus
+    embedder:
+      provider: openai
+      config:
+        api_key: 你的嵌入模型API密钥
+        model: text-embedding-v4
+        openai_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    vector_store:
+      provider: sqlite
+      config: {}
+  nomem:
+    type: nomem
+  mem_local_short:
+    type: mem_local_short
+    llm: ChatGLMLLM
+ASR:
+  FunASR:
+    type: fun_local
+    model_dir: models/SenseVoiceSmall
+    output_dir: tmp/
+    language: zh
+  FunASRServer:
+    type: fun_server
+    host: 127.0.0.1
+    port: 10096
+    is_ssl: true
+    api_key: none
+    output_dir: tmp/
+  SherpaASR:
+    type: sherpa_onnx_local
+    model_dir: models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
+    output_dir: tmp/
+    model_type: sense_voice
+  SherpaParaformerASR:
+    type: sherpa_onnx_local
+    model_dir: models/sherpa-onnx-paraformer-zh-small-2024-03-09
+    output_dir: tmp/
+    model_type: paraformer
+  DoubaoASR:
+    type: doubao
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    cluster: volcengine_input_common
+    boosting_table_name: （选填）你的热词文件名称
+    correct_table_name: （选填）你的替换词文件名称
+    output_dir: tmp/
+  DoubaoStreamASR:
+    type: doubao_stream
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    resource_id: volc.bigasr.sauc.duration
+    boosting_table_name: （选填）你的热词文件名称
+    correct_table_name: （选填）你的替换词文件名称
+    enable_multilingual: false
+    end_window_size: 200
+    output_dir: tmp/
+  DoubaoStreamASRV2:
+    type: doubao_stream
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    resource_id: volc.seedasr.sauc.duration
+    boosting_table_name: （选填）你的热词文件名称
+    correct_table_name: （选填）你的替换词文件名称
+    enable_multilingual: false
+    end_window_size: 200
+    output_dir: tmp/
+  TencentASR:
+    type: tencent
+    appid: 你的腾讯语音合成服务appid
+    secret_id: 你的腾讯语音合成服务secret_id
+    secret_key: 你的腾讯语音合成服务secret_key
+    output_dir: tmp/
+  AliyunASR:
+    type: aliyun
+    appkey: 你的阿里云智能语音交互服务项目Appkey
+    token: 你的阿里云智能语音交互服务AccessToken，临时的24小时，要长期用下方的access_key_id，access_key_secret
+    access_key_id: 你的阿里云账号access_key_id
+    access_key_secret: 你的阿里云账号access_key_secret
+    output_dir: tmp/
+  AliyunStreamASR:
+    type: aliyun_stream
+    appkey: 你的阿里云智能语音交互服务项目Appkey
+    token: 你的阿里云智能语音交互服务AccessToken，临时的24小时，要长期用下方的access_key_id，access_key_secret
+    access_key_id: 你的阿里云账号access_key_id
+    access_key_secret: 你的阿里云账号access_key_secret
+    host: nls-gateway-cn-shanghai.aliyuncs.com
+    max_sentence_silence: 800
+    output_dir: tmp/
+  BaiduASR:
+    type: baidu
+    app_id: 你的百度语音技术AppID
+    api_key: 你的百度语音技术APIKey
+    secret_key: 你的百度语音技术SecretKey
+    dev_pid: 1537
+    output_dir: tmp/
+  OpenaiASR:
+    type: openai
+    api_key: 你的OpenAI API密钥
+    base_url: https://api.openai.com/v1/audio/transcriptions
+    model_name: gpt-4o-mini-transcribe
+    output_dir: tmp/
+  GroqASR:
+    type: openai
+    api_key: 你的Groq API密钥
+    base_url: https://api.groq.com/openai/v1/audio/transcriptions
+    model_name: whisper-large-v3-turbo
+    output_dir: tmp/
+  VoskASR:
+    type: vosk
+    model_path: 你的模型路径，如：models/vosk/vosk-model-small-cn-0.22
+    output_dir: tmp/
+  Qwen3ASRFlash:
+    type: qwen3_asr_flash
+    api_key: 你的阿里云百炼API密钥
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model_name: qwen3-asr-flash
+    output_dir: tmp/
+    enable_lid: true
+    enable_itn: true
+    context: ''
+  XunfeiStreamASR:
+    type: xunfei_stream
+    app_id: 你的APPID
+    api_key: 你的APIKey
+    api_secret: 你的APISecret
+    domain: slm
+    language: zh_cn
+    accent: mandarin
+    output_dir: tmp/
+  AliyunBLStreamASR:
+    type: aliyunbl_stream
+    api_key: 你的阿里云百炼API密钥
+    model: paraformer-realtime-v2
+    format: pcm
+    sample_rate: 16000
+    disfluency_removal_enabled: false
+    semantic_punctuation_enabled: false
+    max_sentence_silence: 200
+    multi_threshold_mode_enabled: false
+    punctuation_prediction_enabled: true
+    inverse_text_normalization_enabled: true
+    output_dir: tmp/
+VAD:
+  SileroVAD:
+    type: silero
+    threshold: 0.5
+    threshold_low: 0.3
+    model_dir: models/snakers4_silero-vad
+    min_silence_duration_ms: 400
+LLM:
+  AliLLM:
+    type: openai
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model_name: qwen-flash
+    api_key: 你的deepseek web key
+    temperature: 0.7
+    max_tokens: 500
+    top_p: 1
+    frequency_penalty: 0
+  AliAppLLM:
+    type: AliBL
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    app_id: 你的app_id
+    api_key: 你的api_key
+    is_no_prompt: true
+    ali_memory_id: false
+  DoubaoLLM:
+    type: openai
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    model_name: doubao-seed-2-0-lite-260215
+    api_key: 你的doubao web key
+  DeepSeekLLM:
+    type: openai
+    model_name: deepseek-v4-flash
+    url: https://api.deepseek.com
+    api_key: 你的deepseek web key
+  ChatGLMLLM:
+    type: openai
+    model_name: glm-4-flash
+    url: https://open.bigmodel.cn/api/paas/v4/
+    api_key: 你的chat-glm web key
+  OllamaLLM:
+    type: ollama
+    model_name: qwen2.5
+    base_url: http://localhost:11434
+  DifyLLM:
+    type: dify
+    base_url: https://api.dify.ai/v1
+    api_key: 你的DifyLLM web key
+    mode: chat-messages
+  GeminiLLM:
+    type: gemini
+    api_key: 你的gemini web key
+    model_name: gemini-2.0-flash
+    http_proxy: ''
+    https_proxy: ''
+  CozeLLM:
+    type: coze
+    bot_id: 你的bot_id
+    user_id: 你的user_id
+    personal_access_token: 你的coze个人令牌
+  VolcesAiGatewayLLM:
+    type: openai
+    base_url: https://ai-gateway.vei.volces.com/v1
+    model_name: doubao-pro-32k-functioncall
+    api_key: 你的网关访问密钥
+  LMStudioLLM:
+    type: openai
+    model_name: deepseek-r1-distill-llama-8b@q4_k_m
+    url: http://localhost:1234/v1
+    api_key: lm-studio
+  HomeAssistant:
+    type: homeassistant
+    base_url: http://homeassistant.local:8123
+    agent_id: conversation.chatgpt
+    api_key: 你的home assistant api访问令牌
+  FastgptLLM:
+    type: fastgpt
+    base_url: https://host/api/v1
+    api_key: 你的fastgpt密钥
+    variables:
+      k: v
+      k2: v2
+  XinferenceLLM:
+    type: xinference
+    model_name: qwen2.5:72b-AWQ
+    base_url: http://localhost:9997
+  XinferenceSmallLLM:
+    type: xinference
+    model_name: qwen2.5:3b-AWQ
+    base_url: http://localhost:9997
+  HermesLLM:
+    type: hermes_voice
+    model_name: hermes-agent
+    url: http://192.168.1.10:8642/v1
+    api_key: 你的Hermes网关api_key
+VLLM:
+  ChatGLMVLLM:
+    type: openai
+    model_name: glm-4v-flash
+    url: https://open.bigmodel.cn/api/paas/v4/
+    api_key: 你的api_key
+  QwenVLVLLM:
+    type: openai
+    model_name: qwen3.5-flash
+    url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: 你的api_key
+  XunfeiSparkLLM:
+    type: openai
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    model_name: lite
+    api_key: 你的api_password
+TTS:
+  EdgeTTS:
+    type: edge
+    voice: zh-CN-XiaoxiaoNeural
+    output_dir: tmp/
+  DoubaoTTS:
+    type: doubao
+    api_url: https://openspeech.bytedance.com/api/v1/tts
+    voice: BV001_streaming
+    output_dir: tmp/
+    authorization: Bearer;
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    cluster: volcano_tts
+    speed_ratio: 1.0
+    volume_ratio: 1.0
+    pitch_ratio: 1.0
+  HuoshanDoubleStreamTTS:
+    type: huoshan_double_stream
+    ws_url: wss://openspeech.bytedance.com/api/v3/tts/bidirection
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    resource_id: volc.service_type.10029
+    speaker: zh_female_wanwanxiaohe_moon_bigtts
+    enable_ws_reuse: true
+    audio_params:
+      speech_rate: 0
+      loudness_rate: 0
+    additions:
+      post_process:
+        pitch: 0
+  HuoshanDoubleStreamTTSV2:
+    type: huoshan_double_stream
+    ws_url: wss://openspeech.bytedance.com/api/v3/tts/bidirection
+    appid: 你的火山引擎语音合成服务appid
+    access_token: 你的火山引擎语音合成服务access_token
+    resource_id: seed-tts-2.0
+    speaker: zh_female_xiaohe_uranus_bigtts
+    enable_ws_reuse: true
+    audio_params:
+      speech_rate: 0
+      loudness_rate: 0
+    additions:
+      post_process:
+        pitch: 0
+  CosyVoiceSiliconflow:
+    type: siliconflow
+    model: FunAudioLLM/CosyVoice2-0.5B
+    voice: FunAudioLLM/CosyVoice2-0.5B:alex
+    output_dir: tmp/
+    access_token: 你的硅基流动API密钥
+    response_format: wav
+  CozeCnTTS:
+    type: cozecn
+    voice: 7426720361733046281
+    output_dir: tmp/
+    access_token: 你的coze web key
+    response_format: wav
+  VolcesAiGatewayTTS:
+    type: openai
+    api_key: 你的网关访问密钥
+    api_url: https://ai-gateway.vei.volces.com/v1/audio/speech
+    model: doubao-tts
+    voice: zh_male_shaonianzixin_moon_bigtts
+    speed: 1
+    output_dir: tmp/
+  FishSpeech:
+    type: fishspeech
+    output_dir: tmp/
+    response_format: wav
+    reference_id: null
+    reference_audio:
+    - config/assets/wakeup_words.wav
+    reference_text:
+    - 哈啰啊，我是小智啦，声音好听的台湾女孩一枚，超开心认识你耶，最近在忙啥，别忘了给我来点有趣的料哦，我超爱听八卦的啦
+    normalize: true
+    max_new_tokens: 1024
+    chunk_length: 200
+    top_p: 0.7
+    repetition_penalty: 1.2
+    temperature: 0.7
+    streaming: false
+    use_memory_cache: 'on'
+    seed: null
+    channels: 1
+    rate: 44100
+    api_key: 你的api_key
+    api_url: http://127.0.0.1:8080/v1/tts
+  GPT_SOVITS_V2:
+    type: gpt_sovits_v2
+    url: http://127.0.0.1:9880/tts
+    output_dir: tmp/
+    text_lang: auto
+    ref_audio_path: demo.wav
+    prompt_text: ''
+    prompt_lang: zh
+    top_k: 5
+    top_p: 1
+    temperature: 1
+    text_split_method: cut0
+    batch_size: 1
+    batch_threshold: 0.75
+    split_bucket: true
+    return_fragment: false
+    speed_factor: 1.0
+    streaming_mode: false
+    seed: -1
+    parallel_infer: true
+    repetition_penalty: 1.35
+    aux_ref_audio_paths: []
+  GPT_SOVITS_V3:
+    type: gpt_sovits_v3
+    url: http://127.0.0.1:9880
+    output_dir: tmp/
+    text_language: auto
+    refer_wav_path: caixukun.wav
+    prompt_language: zh
+    prompt_text: ''
+    top_k: 15
+    top_p: 1.0
+    temperature: 1.0
+    cut_punc: ''
+    speed: 1.0
+    inp_refs: []
+    sample_steps: 32
+    if_sr: false
+  MinimaxTTSHTTPStream:
+    type: minimax_httpstream
+    output_dir: tmp/
+    group_id: 你的minimax平台groupID
+    api_key: 你的minimax平台接口密钥
+    model: speech-01-turbo
+    voice_id: female-shaonv
+  AliyunTTS:
+    type: aliyun
+    output_dir: tmp/
+    appkey: 你的阿里云智能语音交互服务项目Appkey
+    token: 你的阿里云智能语音交互服务AccessToken，临时的24小时，要长期用下方的access_key_id，access_key_secret
+    voice: xiaoyun
+    access_key_id: 你的阿里云账号access_key_id
+    access_key_secret: 你的阿里云账号access_key_secret
+  AliyunStreamTTS:
+    type: aliyun_stream
+    output_dir: tmp/
+    appkey: 你的阿里云智能语音交互服务项目Appkey
+    token: 你的阿里云智能语音交互服务AccessToken，临时的24小时，要长期用下方的access_key_id，access_key_secret
+    voice: longxiaochun
+    access_key_id: 你的阿里云账号access_key_id
+    access_key_secret: 你的阿里云账号access_key_secret
+    host: nls-gateway-cn-beijing.aliyuncs.com
+  TencentTTS:
+    type: tencent
+    output_dir: tmp/
+    appid: 你的腾讯云AppId
+    secret_id: 你的腾讯云SecretID
+    secret_key: 你的腾讯云SecretKey
+    region: ap-guangzhou
+    voice: 101001
+  TTS302AI:
+    type: doubao
+    api_url: https://api.302ai.cn/doubao/tts_hd
+    authorization: 'Bearer '
+    voice: zh_female_wanwanxiaohe_moon_bigtts
+    output_dir: tmp/
+    access_token: 你的302API密钥
+  OpenAITTS:
+    type: openai
+    api_key: 你的openai api key
+    api_url: https://api.openai.com/v1/audio/speech
+    model: tts-1
+    voice: onyx
+    speed: 1
+    output_dir: tmp/
+  CustomTTS:
+    type: custom
+    method: POST
+    url: http://127.0.0.1:8880/v1/audio/speech
+    params:
+      input: '{prompt_text}'
+      response_format: mp3
+      download_format: mp3
+      voice: zf_xiaoxiao
+      lang_code: z
+      return_download_link: true
+      speed: 1
+      stream: false
+    headers: null
+    format: mp3
+    output_dir: tmp/
+  PaddleSpeechTTS:
+    type: paddle_speech
+    protocol: websocket
+    url: ws://127.0.0.1:8092/paddlespeech/tts/streaming
+    spk_id: 0
+    speed: 1.0
+    volume: 1.0
+    save_path: null
+  IndexStreamTTS:
+    type: index_stream
+    api_url: http://127.0.0.1:11996/tts
+    audio_format: pcm
+    voice: jay_klee
+    output_dir: tmp/
+  AliBLTTS:
+    type: alibl_stream
+    api_key: 你的api_key
+    ws_url: wss://dashscope.aliyuncs.com/api-ws/v1/inference/
+    model: cosyvoice-v2
+    voice: longcheng_v2
+    output_dir: tmp/
+  XunFeiTTS:
+    type: xunfei_stream
+    api_url: wss://cbm01.cn-huabei-1.xf-yun.com/v1/private/mcd9m97e6
+    app_id: 你的app_id
+    api_secret: 你的api_secret
+    api_key: 你的api_key
+    voice: x5_lingxiaoxuan_flow
+    output_dir: tmp/
+  NativeText:
+    type: native_text
+    output_dir: tmp/

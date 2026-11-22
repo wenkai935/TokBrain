@@ -1,0 +1,31 @@
+# 小七桥接容器 compose 样例（脱敏版）
+# 这是家里 NAS 上实际在用的结构：host 网络 + 单文件挂载 voice-patch 补丁。
+# 字段名/挂载点保持真实结构，镜像与本地路径按你的环境替换。
+services:
+  bridge:
+    # 换成你自己构建/拉取的镜像（这里用占位符，不要写死别人的 digest）
+    image: your-registry/xiaoqi-bridge:latest
+    container_name: xiaoqi-bridge
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PYTHONUNBUFFERED: '1'
+      XIAOZHI_TTS_OUTPUT_MODE: native_xiaomi
+    volumes:
+    # 曲库目录（只读挂进容器）
+    - /path/to/your/music:/music:ro
+    # 配置与模型
+    - /path/to/xiaoqi/config.py:/app/config.py:ro
+    - /path/to/xiaoqi/models:/app/xiaozhi/models
+    - /path/to/xiaoqi/logs:/app/logs
+    # voice-patch：小七对上游桥接的本地补丁（见 deploy 说明）
+    - /path/to/xiaoqi/voice-patch/event.py:/app/xiaozhi/event.py:ro
+    - /path/to/xiaoqi/voice-patch/playback_gate.py:/app/playback_gate.py:ro
+    - /path/to/xiaoqi/voice-patch/xiaoai.py:/app/xiaozhi/xiaoai.py:ro
+    - /path/to/xiaoqi/voice-patch/lx06_audio.py:/app/lx06_audio.py:ro
+    - /path/to/xiaoqi/playback:/path/to/xiaoqi/playback
+
+# 说明：
+# - 真实部署里 image 是一串 sha256 digest；开源样例用语义化 tag，避免绑定你的私有镜像。
+# - 端口 4400（音乐桥）、4399（音箱 client 连接）靠 network_mode: host 直接暴露，
+#   生产环境请注意防火墙，切勿把 4400 暴露到公网（当前无鉴权）。

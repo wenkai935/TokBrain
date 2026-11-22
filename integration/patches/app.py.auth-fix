@@ -1,0 +1,729 @@
+# -*- coding: utf-8 -*-
+"""life-agent：常驻在 NAS 上的生活记录服务。
+
+职责边界（重要）：
+  NAS 这端只做「不需要思考的事」——
+    存事件、按时间触发提醒、调 HA 控设备、让小爱说话、每日备份。
+  需要理解和判断的（你说的话怎么拆、周总结怎么写）交给 PC 端的藤子或 LLM API。
+
+接口：
+  GET  /health                    健康检查 + 事件总数
+  POST /event                     追加事件
+  GET  /events?days=7&cat=work    查询
+  POST /say?text=...              让小爱播报
+  POST /voice                     语音入口：收一句文本，走同一套意图（记事/提醒/开灯）
+  POST /remind                    加一条提醒
+  GET  /reminders                 看未触发的提醒
+  POST /backup                    手动备份（内部定时任务也调它）
+  POST /file_drop                 PC 上传文件到中转目录（X-Token 鉴权），返回微信可发的本地路径
+
+环境变量：
+  HA_URL     默认 http://192.168.10.107:8123
+  HA_TOKEN   HA 长期访问令牌
+  DB_PATH    默认 /data/life.db
+  TZ         默认 Asia/Shanghai
+"""
+import os
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from contextlib import closing
+
+import httpx
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import Request
+from pydantic import BaseModel
+
+import intent
+from ha_watch import HaWatcher
+from sys_watch import SysWatcher
+
+HA_URL = os.getenv("HA_URL", "http://192.168.10.107:8123").rstrip("/")
+HA_TOKEN = os.getenv("HA_TOKEN", "")
+DB_PATH = os.getenv("DB_PATH", "/data/life.db")
+BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups"))
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "14"))
+API_TOKEN = os.getenv("API_TOKEN", "")     # 空 = 不鉴权（仅限纯内网）
+PAIR_CODE = os.getenv("PAIR_CODE", "")     # 手机首次配对用的 6 位码
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 2026-11-23 统一认证（批次A播报）：外部调用除 X-Token 外，也接受 xiaoqi-auth 短期票据。
+# 两者皆无才 401；X-Token 保留 → 现有 life.py / timer 不受影响，可灰度。
+XIAOQI_AUTH_URL = os.getenv("XIAOQI_AUTH_URL", "").rstrip("/")
+VOICE_AUD = "xiaozhi-gateway"
+VOICE_SCOPE = "voice:announce"
+
+
+def _ticket_ok(authorization: str) -> bool:
+    """验 Bearer 票据（aud=xiaozhi-gateway, scope=voice:announce）。失败一律 False。"""
+    if not XIAOQI_AUTH_URL or not authorization:
+        return False
+    parts = authorization.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return False
+    body = None
+    try:
+        import json as _json
+        import urllib.request as _u
+        body = _json.dumps({"token": parts[1], "aud": VOICE_AUD, "scope": VOICE_SCOPE}).encode()
+        req = _u.Request(XIAOQI_AUTH_URL + "/verify", data=body,
+                         headers={"Content-Type": "application/json"})
+        with _u.urlopen(req, timeout=3) as r:
+            return bool(_json.loads(r.read().decode("utf-8")).get("valid"))
+    except Exception:
+        return False
+
+# 文件中转：PC 上传 → 微信网关当附件发出。文件名会被重写成 ASCII 安全名，
+# 因为微信网关的附件路径正则不接受中文和空格。
+FILE_DROP_DIR = os.getenv("FILE_DROP_DIR", os.path.join(BASE_DIR, "data", "file_drop"))
+FILE_DROP_MAX = int(os.getenv("FILE_DROP_MAX", str(50 * 1024 * 1024)))  # 单文件 50MB
+FILE_DROP_TTL_H = int(os.getenv("FILE_DROP_TTL_H", "24"))  # 中转文件保留 24h
+SPEAKER = os.getenv(
+    "SPEAKER", "notify.xiaomi_cn_936363184_lx06_play_text_a_5_1")
+MEDIA = os.getenv("MEDIA", "media_player.xiaomi_cn_936363184_lx06")
+# 小爱的「当前音频ID」是独立 sensor（不在播放器属性里）：空 = TTS 播报中，有值 = 歌曲。
+# 用来判断播报的起止，进而把播放器恢复成播报前的状态。
+AUDIO_ID = os.getenv(
+    "AUDIO_ID", "sensor.xiaomi_cn_936363184_lx06_audio_id_p_5_4")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_start TEXT NOT NULL, ts_end TEXT,
+    category TEXT NOT NULL, title TEXT NOT NULL, detail TEXT,
+    energy INTEGER, focus INTEGER,
+    source TEXT NOT NULL, device TEXT, tags TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_start ON events(ts_start);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    due_at TEXT NOT NULL,
+    text TEXT NOT NULL,
+    repeat TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    fired_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_at);
+
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    date         TEXT PRIMARY KEY,
+    generated_at TEXT NOT NULL,
+    events_n     INTEGER,
+    text         TEXT,
+    stats_json   TEXT
+);
+"""
+
+app = FastAPI(title="life-agent")
+
+# 这些路径本身不含数据，允许匿名访问；/pair 靠 6 位码自己把关。
+PUBLIC_PATHS = {"/", "/ui.html", "/manifest.webmanifest", "/icon.svg",
+                "/favicon.ico", "/pair"}
+
+_pair_fail = {"n": 0, "until": 0.0}
+
+
+@app.middleware("http")
+async def require_token(request, call_next):
+    """本机回环免鉴权；外部须带 X-Token 或有效 Bearer 票据（二选一）。"""
+    if API_TOKEN:
+        host = request.client.host if request.client else ""
+        if host not in ("127.0.0.1", "::1"):
+            path = request.url.path
+            if path not in PUBLIC_PATHS:
+                has_xtoken = request.headers.get("x-token") == API_TOKEN
+                # 票据校验是同步 I/O，放进线程池，别阻塞事件循环
+                has_ticket = False
+                authz = request.headers.get("authorization", "")
+                if not has_xtoken and authz:
+                    import anyio
+                    has_ticket = await anyio.to_thread.run_sync(_ticket_ok, authz)
+                if not (has_xtoken or has_ticket):
+                    return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/")
+def index():
+    """手机记事页。"""
+    return FileResponse(os.path.join(BASE_DIR, "ui.html"),
+                        media_type="text/html; charset=utf-8",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return {
+        "name": "记事", "short_name": "记事",
+        "start_url": "/", "display": "standalone",
+        "background_color": "#0f1115", "theme_color": "#0f1115",
+        "icons": [{"src": "/icon.svg", "sizes": "any",
+                   "type": "image/svg+xml", "purpose": "any maskable"}],
+    }
+
+
+@app.get("/icon.svg")
+def icon():
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
+           '<rect width="192" height="192" rx="44" fill="#0f1115"/>'
+           '<rect x="56" y="50" width="80" height="10" rx="5" fill="#6c8cff"/>'
+           '<rect x="56" y="84" width="80" height="10" rx="5" fill="#6c8cff"/>'
+           '<rect x="56" y="118" width="46" height="10" rx="5" fill="#3f4c66"/>'
+           '<circle cx="136" cy="139" r="20" fill="#3ddc97"/></svg>')
+    return Response(svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.post("/pair")
+def pair(code: str):
+    """用 6 位配对码换 API 令牌。失败 8 次锁 5 分钟，防爆破。"""
+    now_ts = time.time()
+    if now_ts < _pair_fail["until"]:
+        raise HTTPException(429, "试错太多次，等 5 分钟")
+    if not API_TOKEN:
+        return {"token": ""}          # 没开鉴权，无需令牌
+    if not PAIR_CODE:
+        raise HTTPException(503, "服务端未设置 PAIR_CODE")
+    if code.strip() != PAIR_CODE:
+        _pair_fail["n"] += 1
+        if _pair_fail["n"] >= 8:
+            _pair_fail.update(n=0, until=now_ts + 300)
+            print("配对码连续错 8 次，锁定 5 分钟")
+        raise HTTPException(403, "配对码不对")
+    _pair_fail.update(n=0, until=0.0)
+    print("设备配对成功")
+    return {"token": API_TOKEN}
+
+
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def db():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def ha_post(path, payload):
+    if not HA_TOKEN:
+        raise HTTPException(500, "HA_TOKEN 没配置")
+    with httpx.Client(timeout=20) as c:
+        r = c.post(f"{HA_URL}{path}", json=payload,
+                   headers={"Authorization": f"Bearer {HA_TOKEN}"})
+    return r.status_code
+
+
+def ha_get(path):
+    """查 HA 实体状态；读不到返回 None。恢复逻辑靠它探状态，但不许它炸掉播报。"""
+    if not HA_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = c.get(f"{HA_URL}{path}",
+                      headers={"Authorization": f"Bearer {HA_TOKEN}"})
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def _media_state(with_audio=True):
+    """读小爱播放器，返回 (state, is_muted, volume, audio_id)；读不到返回 (None, None, None, None)。
+
+    with_audio=False 跳过 audio_id 传感器那次请求：恢复流程里的轮询每秒要读 10 次，
+    却根本不看 audio_id，多读一次就是白搭一半的 HTTP 往返和 Client 创建（2026-10-31）。
+    """
+    st = ha_get(f"/api/states/{MEDIA}")
+    if not st:
+        return None, None, None, None
+    attrs = st.get("attributes") or {}
+    aid = None
+    if with_audio:
+        aid = (ha_get(f"/api/states/{AUDIO_ID}") or {}).get("state")
+        # 字符串 "unknown"/"unavailable" 在 bool() 下为真，会把「没有曲目会话」误判成有，
+        # 让播报后多走一遍止损分支。统一归一成 None（2026-10-31）。
+        if aid in (None, "", "unknown", "unavailable"):
+            aid = None
+    return (st.get("state"), bool(attrs.get("is_volume_muted")),
+            attrs.get("volume_level"), aid)
+
+
+def _tts_wait_seconds(text):
+    """估算从「小爱开口」到「说完」的秒数。
+
+    2026-10-31 收紧：原按 4 字/秒 + 3s 余量（6 个字估 4.5s），实测明显偏保守，
+    话早说完了还在干等。改为 5 字/秒 + 1.5s；实际语速 4~6 字/秒，取在下沿附近，
+    宁可多等半秒也不截断播报。
+    """
+    n = len([c for c in text if not c.isspace()])
+    return max(n / 5.0, 1.0) + 1.5
+
+
+def _set_muted(target, tries=3, gap=0.1):
+    """下发静音/解除静音，并回读确认是否到位。
+
+    2026-10-31 实测：没有任何调用的情况下，同一实体 12:47 是 playing/muted=False，
+    12:50 变成 idle/muted=True —— 小米云端会自己改 is_volume_muted。
+    所以「命令发出去了」不等于「状态真变了」，必须回读，不到位就重发。
+    """
+    for i in range(tries):
+        ha_post("/api/services/media_player/volume_mute",
+                {"entity_id": MEDIA, "is_volume_muted": target})
+        time.sleep(gap)
+        _, muted, _, _ = _media_state(with_audio=False)
+        if muted is None:
+            return False          # 读不到状态就别再猜
+        if muted == target:
+            return True
+        print(f"[speak] 静音回读不符（第 {i + 1} 次：期望 {target}，实际 {muted}），重发")
+    return False
+
+
+def _restore_media(prev_state, prev_audio_id, prev_muted, text):
+    """等 TTS 播完，把播放器按回播报前的状态。
+
+    2026-10-25 三次实测后的结论（每次都是一个坑）：
+    1) 小爱语音喊的「暂停」在 HA 里报的是 idle（全天 logbook 没有 paused 记录），
+       所以「播前有曲目会话」要同时看 audio_id 有没有值。
+    2) TTS 播放期间 audio_id 不清空、media_title 为空、state 恒为 idle——
+       播放器在 TTS 说话期间根本不报 playing，「等 playing 启动」会白等满超时，
+       还连带把「等估算时长再检查」整体推迟，歌凭空多响 6~7 秒。
+    3) TTS 说完小爱自动续媒体时，state 才发生 idle→playing 跳变；
+       media_pause 慢生效（分钟级），media_stop 不支持（400）。
+    所以现在：等 muted 翻转确认 TTS 启动 → 轮询 idle→playing 跳变（0.2s 间隔）
+    → 一跳变立即静音（秒级没声）+ 补 pause（分钟级兜底），止损延迟亚秒级。
+    """
+    deadline = time.time() + 120
+
+    # 1) 等 TTS 启动：解静音生效（muted 翻成 False）即小爱要开口，最多等 6s
+    tts_started = None
+    startup_deadline = min(time.time() + 6, deadline)
+    while time.time() < startup_deadline:
+        state, muted, _, _ = _media_state(with_audio=False)
+        if not muted or state == "playing":
+            tts_started = time.time()
+            break
+        time.sleep(0.2)
+    if tts_started is None:
+        tts_started = time.time()  # 没等到也别卡死，继续走
+
+    # 2) 最短播报保护：TTS 刚开口那两秒内出现的 playing 不急着止损，
+    #    防止万一小爱状态机抽风把 TTS 自己也报成 playing，误伤播报
+    min_speak = max(2.0, len([c for c in text if not c.isspace()]) / 6.0)
+
+    # 3) 等 TTS 说完：idle→playing 跳变 = 小爱把暂停的歌续上了，立即收尾止损。
+    #    2026-10-31 收紧：原来固定 +5s 余量、0.2s 轮询，6 个字的播报要等满 9.5s；
+    #    而播前静音且没有曲目会话时根本不会有跳变，那段纯属空等。
+    #    现在：有会话才留 1s 观察窗，无会话只留 0.3s，轮询 0.1s，条件一满足立刻走。
+    has_session = prev_state in ("playing", "paused") or \
+        (prev_state == "idle" and bool(prev_audio_id))
+    slack = 1.0 if has_session else 0.3
+    watch_deadline = min(time.time() + max(_tts_wait_seconds(text), min_speak) + slack,
+                         deadline)
+    while time.time() < watch_deadline:
+        state, muted, _, _ = _media_state(with_audio=False)
+        if state == "playing" and time.time() - tts_started >= min_speak:
+            break
+        time.sleep(0.1)
+
+    # 4) 按原状态恢复
+    state, muted, _, _ = _media_state(with_audio=False)
+    paused_before = prev_state == "paused" or \
+        (prev_state == "idle" and bool(prev_audio_id))
+    if paused_before and state == "playing":
+        # 小爱把暂停的歌恢复成了播放。实测 media_pause 慢生效（分钟级），
+        # 先静音秒级止损（没声），再补 pause 兜底让它最终停下来。
+        ok = _set_muted(True)
+        ha_post("/api/services/media_player/media_pause",
+                {"entity_id": MEDIA})
+        print(f"[speak] 播报前是暂停态，被小爱恢复成了播放，"
+              f"已静音止损（{'回读确认' if ok else '回读未确认'}）并补发 pause")
+        return
+    if prev_muted:
+        # 播前就是静音的：播完必须回到静音。
+        # 2026-10-31 改动：原来只在 muted 已经变成 False 时补一次、且不看结果。
+        # 一旦那一次失败，下次播报读到的 prev_muted 就是 False，
+        # 恢复逻辑从此永久不触发 —— 这就是「播报后静音失效重复出现」的根因。
+        if muted:
+            print("[speak] 播报前是静音态，当前仍是静音，无需动作")
+            return
+        ok = _set_muted(True)
+        print(f"[speak] 播报前是静音态，已恢复静音"
+              f"（{'回读确认' if ok else '重试 3 次仍未确认'}）")
+        return
+    # 出口 C 原本完全静默，出问题无从追查，补一条可观测日志
+    print(f"[speak] 无恢复动作：播前 state={prev_state} muted={prev_muted} "
+          f"audio_id={prev_audio_id}，播后 state={state} muted={muted}")
+
+
+def _speak_now(text):
+    """让小爱说话：先解静音，再下发文本；播完后把播放器按回原状。
+
+    播报前存在媒体会话（playing / paused / idle 但有曲目）时才需要管恢复；
+    恢复动作本身出错只记日志，绝不影响播报本身。
+    """
+    prev_state, prev_muted, _, prev_audio_id = _media_state()
+    ha_post("/api/services/media_player/volume_mute",
+            {"entity_id": MEDIA, "is_volume_muted": False})
+    status = ha_post("/api/services/notify/send_message",
+                     {"entity_id": SPEAKER, "message": text})
+    if not 200 <= status < 300:
+        raise HTTPException(502, "音箱播报未被接受")
+    has_session = prev_state in ("playing", "paused") or \
+        (prev_state == "idle" and bool(prev_audio_id))
+    # 2026-10-31：恢复静音不再依赖「有没有媒体会话」。播前是静音就必须还回静音，
+    # 否则没放歌时的一次播报会把音箱永久留在非静音状态。
+    if has_session or prev_muted:
+        try:
+            _restore_media(prev_state, prev_audio_id, prev_muted, text)
+        except Exception as ex:
+            print(f"[speak] 播报后恢复失败（不影响本次播报）: {ex}")
+    return status
+
+
+from announcement_queue import Announcements
+
+# Quiet-hour decisions remain at their existing trusted sources. In particular,
+# the explicitly authorized 06:00 morning-weather rule must keep working.
+_announcements = Announcements(os.path.join(os.path.dirname(DB_PATH), 'announcements.db'),
+                               _speak_now, quiet=lambda: False)
+
+def speak(text):
+    return _announcements.submit(text)
+
+@app.get('/announcements/status')
+def announcement_status():
+    return {'counts': _announcements.status(), 'note': 'submitted means accepted, not acoustic confirmation'}
+
+
+def backup():
+    """用 SQLite 在线备份 API 拷一份快照，只保留最近 BACKUP_KEEP 份。"""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d")
+    dst_path = os.path.join(BACKUP_DIR, f"life-{stamp}.db")
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as src, \
+                closing(sqlite3.connect(dst_path)) as dst:
+            src.backup(dst)
+        files = sorted(f for f in os.listdir(BACKUP_DIR) if f.endswith(".db"))
+        for old in files[:-BACKUP_KEEP]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+            except OSError:
+                pass
+        size = os.path.getsize(dst_path)
+        print(f"备份完成 {dst_path} ({size} B)，现存 {min(len(files), BACKUP_KEEP)} 份")
+        return {"ok": True, "path": dst_path, "bytes": size, "kept": min(len(files), BACKUP_KEEP)}
+    except Exception as ex:
+        print(f"备份失败: {ex}")
+        return {"ok": False, "error": str(ex)}
+
+
+class EventIn(BaseModel):
+    title: str
+    category: str = "other"
+    detail: str | None = None
+    ts_start: str | None = None
+    ts_end: str | None = None
+    energy: int | None = None
+    focus: int | None = None
+    source: str = "manual"
+    device: str | None = None
+    tags: str | None = None
+
+
+class RemindIn(BaseModel):
+    text: str
+    due_at: str | None = None
+    in_minutes: int | None = None
+
+
+class VoiceIn(BaseModel):
+    text: str
+    source: str = "unknown"        # lx06 / laptop / curl，只用于留痕
+
+
+@app.post("/file_drop")
+async def file_drop(request: Request, token: str = "", filename: str = "file"):
+    """PC 经 Tailscale 上传文件字节到中转目录，返回微信网关可识别的本地绝对路径。
+
+    用原始请求体而非 multipart——life-agent 的 venv 没装 python-multipart，
+    装它还要走代理，没必要为一个上传端点引入依赖。
+
+    鉴权沿用 life-agent 的 API_TOKEN（X-Token 头或 token 参数），不引入新令牌。
+    文件名强制重写为 ASCII 安全名：微信网关的附件路径正则只接受 [\\w.\\-]，
+    中文名/空格会被它跳过，导致"说了发文件却没发出来"。
+    """
+    supplied = request.headers.get("x-token") or token
+    if not API_TOKEN or supplied != API_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    import re as _re
+    import uuid
+
+    raw = (filename or "file")[:200]
+    ext = os.path.splitext(raw)[1].lower()
+    if not _re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+        ext = ".bin"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = f"fd_{stamp}_{uuid.uuid4().hex[:8]}{ext}"
+    os.makedirs(FILE_DROP_DIR, exist_ok=True)
+    dest = os.path.join(FILE_DROP_DIR, safe)
+
+    body = await request.body()
+    if len(body) > FILE_DROP_MAX:
+        raise HTTPException(status_code=413, detail="file too large")
+    with open(dest, "wb") as f:
+        f.write(body)
+    total = len(body)
+
+    # 顺手清理过期中转文件（每次上传时扫一遍，不额外起定时器）
+    try:
+        cutoff = time.time() - FILE_DROP_TTL_H * 3600
+        for name in os.listdir(FILE_DROP_DIR):
+            fp = os.path.join(FILE_DROP_DIR, name)
+            if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                os.remove(fp)
+    except Exception:
+        pass
+
+    return {"ok": True, "path": dest, "name": safe,
+            "original": raw, "size": total}
+
+
+@app.get("/health")
+def health():
+    with closing(db()) as c:
+        n = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        r = c.execute("SELECT COUNT(*) FROM reminders WHERE enabled=1").fetchone()[0]
+    return {"ok": True, "events": n, "reminders": r, "server_time": now()}
+
+
+@app.post("/event")
+def add_event(e: EventIn):
+    with closing(db()) as c:
+        cur = c.execute(
+            """INSERT INTO events (ts_start, ts_end, category, title, detail,
+                                   energy, focus, source, device, tags, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (e.ts_start or now(), e.ts_end, e.category, e.title, e.detail,
+             e.energy, e.focus, e.source, e.device, e.tags, now()))
+        c.commit()
+        return {"id": cur.lastrowid}
+
+
+@app.get("/events")
+def list_events(days: int = 7, cat: str | None = None, limit: int = 100):
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    sql = "SELECT * FROM events WHERE ts_start >= ?"
+    args = [since]
+    if cat:
+        sql += " AND category = ?"
+        args.append(cat)
+    sql += " ORDER BY ts_start DESC LIMIT ?"
+    args.append(limit)
+    with closing(db()) as c:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+
+@app.post("/say")
+def say(text: str):
+    return {"status": speak(text)}
+
+
+@app.post("/voice")
+def voice_in(v: VoiceIn):
+    """语音入口：耳朵只负责「把话变成文字」，怎么做事由这里决定。
+
+    解析在 intent.parse（纯函数），这里只执行：落库 / 建提醒 / 控灯 / 播报。
+    bridge 在宿主机上打 127.0.0.1:8787，走回环免鉴权。
+    """
+    r = intent.parse(v.text)
+    if r is None:
+        print(f"[voice] 没听懂（{v.source}）: {v.text}")
+        return {"ok": True, "action": "none", "reply": None, "heard": v.text}
+
+    act, p = r["action"], r["payload"]
+    if act == "record":
+        add_event(EventIn(title=p["body"], category=p["category"],
+                          detail=f"语音录入 · {v.source}", source="voice"))
+    elif act == "remind":
+        add_remind(RemindIn(text=p["text"], due_at=p["due_at"]))
+    elif act == "light":
+        eid = intent.LIGHTS.get(p["room"], intent.LIGHTS["客厅"])
+        ha_post(f"/api/services/switch/{'turn_on' if p['on'] else 'turn_off'}",
+                {"entity_id": eid})
+
+    reply = r.get("reply")
+    if reply:
+        try:
+            speak(reply)
+        except Exception as ex:
+            print(f"[voice] 播报失败: {ex}")
+    return {"ok": True, "action": act, "reply": reply, "heard": v.text}
+
+
+@app.post("/remind")
+def add_remind(r: RemindIn):
+    if r.due_at:
+        due = r.due_at
+    elif r.in_minutes is not None:
+        due = (datetime.now() + timedelta(minutes=r.in_minutes)).strftime(
+            "%Y-%m-%d %H:%M:%S")
+    else:
+        raise HTTPException(400, "due_at 和 in_minutes 至少给一个")
+    with closing(db()) as c:
+        cur = c.execute(
+            "INSERT INTO reminders (due_at, text, created_at) VALUES (?,?,?)",
+            (due, r.text, now()))
+        c.commit()
+        return {"id": cur.lastrowid, "due_at": due}
+
+
+@app.get("/reminders")
+def list_reminders():
+    with closing(db()) as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM reminders WHERE enabled=1 ORDER BY due_at").fetchall()]
+
+
+@app.post("/backup")
+def do_backup():
+    return backup()
+
+
+@app.post("/hasync")
+def force_ha_sync():
+    """手动触发一次 HA 采集（自检用）。"""
+    return {"new": watcher.sync()}
+
+
+@app.get("/summaries")
+def list_summaries(days: int = 14):
+    with closing(db()) as c:
+        rows = c.execute(
+            "SELECT * FROM daily_summaries ORDER BY date DESC LIMIT ?",
+            (days,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/memory/context")
+def memory_context():
+    from memory import context
+    return context(DB_PATH)
+
+
+@app.get("/rules/morning-weather")
+def morning_weather_status():
+    path = '/vol1/1000/hermes-state/home-rules.db'
+    if not os.path.exists(path):
+        return {"configured": False}
+    import json
+    with closing(sqlite3.connect('file:'+path+'?mode=ro', uri=True)) as c:
+        c.row_factory = sqlite3.Row
+        connection = c.execute("SELECT value FROM rule_runtime WHERE key='connection'").fetchone()
+        days = [dict(r) for r in c.execute('''SELECT date,armed_at,attempted_at,
+            delivered_at,state,last_error FROM morning_weather_days ORDER BY date DESC LIMIT 7''')]
+    return {"configured": True, "timezone": "Asia/Shanghai", "morning": "06:00–10:00",
+            "trigger": "空调关闭后，当天首次实际出冰", "calendar": "中国法定工作日，含调休",
+            "connection": json.loads(connection['value']) if connection else None, "days": days}
+
+
+class MemoryIn(BaseModel):
+    key: str
+    text: str
+    kind: str
+    user_quote: str
+    expires_at: str | None = None
+    valid_from: str | None = None
+
+
+class MemoryRetractIn(BaseModel):
+    key: str
+    user_quote: str
+    kind: str | None = None
+
+
+@app.post("/memory/remember")
+def memory_remember(v: MemoryIn):
+    from memory import remember
+    try:
+        return remember(**v.model_dump(), path=DB_PATH)
+    except (ValueError, TypeError) as ex:
+        raise HTTPException(400, str(ex))
+
+
+@app.post("/memory/retract")
+def memory_retract(v: MemoryRetractIn):
+    from memory import retract
+    try:
+        return retract(**v.model_dump(), path=DB_PATH)
+    except (ValueError, TypeError) as ex:
+        raise HTTPException(400, str(ex))
+
+
+@app.get("/sysstat")
+def sys_stat(days: int = 30):
+    """机内温度日峰值与电池状态。这台机器设不了充电阈值，只能盯温度。"""
+    latest = sysw.sample() or {}
+    return {"latest": latest, "daily": sysw.daily_stats(days),
+            "alert_threshold": sysw.threshold}
+
+
+
+def tick():
+    """每分钟检查一次到期提醒，到点就播报。"""
+    due = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(db()) as c:
+        rows = c.execute(
+            "SELECT * FROM reminders WHERE enabled=1 AND fired_at IS NULL "
+            "AND due_at <= ?", (due,)).fetchall()
+        for r in rows:
+            try:
+                speak(r["text"])
+                c.execute("UPDATE reminders SET fired_at=? WHERE id=?",
+                          (now(), r["id"]))
+                c.commit()
+            except Exception as ex:
+                print(f"提醒 #{r['id']} 播报失败: {ex}")
+
+
+scheduler = BackgroundScheduler(timezone=os.getenv("TZ", "Asia/Shanghai"))
+scheduler.add_job(tick, "interval", minutes=1, id="tick")
+scheduler.add_job(_announcements.tick, "interval", seconds=2, id="announcement_queue", max_instances=1, coalesce=True)
+scheduler.add_job(backup, "cron", hour=3, minute=30, id="backup")
+
+watcher = HaWatcher(HA_URL, HA_TOKEN, DB_PATH)
+scheduler.add_job(watcher.sync, "interval", seconds=30, id="ha_sync",
+                  next_run_time=datetime.now() + timedelta(seconds=8))
+
+sysw = SysWatcher(DB_PATH)
+
+
+def sys_tick():
+    """采样温度/电池；过热时提醒一次（每天最多一条）。"""
+    s = sysw.sample()
+    msg = sysw.check_alert(s)
+    if msg:
+        try:
+            speak(msg)
+        except Exception as ex:
+            print(f"[sys_watch] 播报失败: {ex}")
+
+
+scheduler.add_job(sys_tick, "interval", minutes=10, id="sys_tick",
+                  next_run_time=datetime.now() + timedelta(seconds=20))
+scheduler.start()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8787")))

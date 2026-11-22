@@ -1,0 +1,790 @@
+"""Private stdio MCP adapter for the existing NAS tools. No standalone listener."""
+import contextlib
+import copy
+import json
+import os
+import sys
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo('Asia/Shanghai')
+except Exception:
+    TZ = timezone(timedelta(hours=8), 'Asia/Shanghai')
+
+for line in open('/vol1/1000/agent/.env'):
+    if '=' in line and not line.lstrip().startswith('#'):
+        key, value = line.strip().split('=', 1)
+        os.environ[key] = value.strip().strip('"').strip("'")
+sys.path.insert(0, '/vol1/1000/agent-llm')
+with contextlib.redirect_stdout(sys.stderr):
+    from tools import TOOLS, ToolCtx, exec_tool
+    from config import LIGHTS, ICE_MAKERS, ICE_SIZE, CLIMATE, INFRARED_CLIMATE
+
+# 只读通道（小七语音）与可写通道（Hermes 主通道）共用本脚本，靠环境变量区分。
+READ_ONLY = os.environ.get('HOME_MCP_READ_ONLY') == '1'
+
+schemas = {}
+for item in TOOLS:
+    f = copy.deepcopy(item['function'])
+    if f['name'] == 'device_set':
+        if READ_ONLY:
+            # 只读通道不暴露空调：既不加 CLIMATE，也不加 temp/mode，
+            # 让模型根本不会想到去调，而不是调到一半被 READ_ONLY 拦掉。
+            f['description'] = '只读通道，本通道不允许控制任何设备。'
+            f['parameters'] = {
+                'type': 'object', 'properties': {
+                    'device': {'type': 'string', 'enum': list(LIGHTS) + list(ICE_MAKERS)},
+                    'power': {'type': 'string', 'enum': ['on', 'off']}},
+                'required': ['device', 'power'], 'additionalProperties': False}
+        else:
+            # 2026-10-29 起空调改为立即下发，不再有 device_confirm 这一步。
+            # 2026-11-13 起制冰机多一条 size：大冰块/小冰块由大肥鱼自己切，不用再找人。
+            f['description'] = (
+                '控制白名单内的家电。device 只能用别名，一次一个。'
+                '灯和餐厅制冰机给 power=on/off，立即生效并回读校验。'
+                '制冰机可另给 size（大冰块/小冰块），与 power 可同给。'
+                '空调给 mode（含 off 表示关机）或 temp，调用即下发，不需要再确认。'
+                '客厅空调是红外遥控：只能发指令，读不回状态，返回 verified 为 null，'
+                '不要向用户承诺「已确认关闭」，只能说「关机码已发出」。')
+            f['parameters'] = {
+                'type': 'object', 'properties': {
+                    'device': {'type': 'string',
+                               'enum': list(LIGHTS) + list(CLIMATE)
+                               + list(INFRARED_CLIMATE) + list(ICE_MAKERS)},
+                    'power': {'type': 'string', 'enum': ['on', 'off'],
+                              'description': '灯和开关用这个'},
+                    'size': {'type': 'string', 'enum': ['大冰块', '小冰块'],
+                             'description': '仅餐厅制冰机：制冰尺寸'},
+                    'temp': {'type': 'integer', 'minimum': 18, 'maximum': 28,
+                             'description': '空调目标温度（18-28）'},
+                    'mode': {'type': 'string',
+                             'enum': ['auto', 'cool', 'heat', 'dry', 'fan_only', 'off'],
+                             'description': '空调模式'}},
+                'required': ['device'], 'additionalProperties': False}
+    schemas[f['name']] = {'name': f['name'], 'description': f['description'],
+                          'inputSchema': f['parameters']}
+
+for name, description, props, required in [
+    ('morning_weather_status', '查询已配置的晨间天气联动、事件连接状态及每日播报记录；不会触发播报。', {}, []),
+    ('memory_context', '查询近期事件、临时例外、明确偏好和有证据的长期模式；回答用户过去经历或偏好前必须调用。', {}, []),
+    ('memory_remember', '仅在用户明确要求记住或更正时保存原话。今天/本周等临时安排必须标 temporary 并给 expires_at；时间不明确先问。',
+     {'key': {'type': 'string'}, 'text': {'type': 'string'},
+      'kind': {'type': 'string', 'enum': ['temporary', 'preference', 'fact']},
+      'user_quote': {'type': 'string'}, 'expires_at': {'type': 'string'}, 'valid_from': {'type': 'string'}},
+     ['key', 'text', 'kind', 'user_quote']),
+    ('memory_retract', '用户明确要求忘记或否认某项特征时撤回该 key，并抑制同名统计推断再次出现。',
+     {'key': {'type': 'string'}, 'user_quote': {'type': 'string'},
+      'kind': {'type': 'string', 'enum': ['temporary', 'preference', 'fact'],
+               'description': '取消临时例外时必须填 temporary；省略表示撤回该 key 的所有层。'}}, ['key', 'user_quote']),
+    ('ha_presence', '查询老张当前是否在家、在哪。位置由手机通过 HA Companion App 的地理围栏上报，只读。'
+     '回答「我在哪」「到家没」「是否在家」用这个；状态为 unknown 时说明手机尚未上报，'
+     '不得根据灯光、活动记录或猜测回答。', {}, [])]:
+    schemas[name] = {'name': name, 'description': description,
+                     'inputSchema': {'type': 'object', 'properties': props, 'required': required,
+                                     'additionalProperties': False}}
+
+# 即时回复词策略：内容归大肥鱼裁定，机制不归它——那条"请求发出即播"的规则写死在
+# 语音传输层里，这里没有对应开关，也永远不会有。
+schemas['voice_ack_policy'] = {
+    'name': 'voice_ack_policy',
+    'description': ('查看或修改语音即时回复词（回应前先播的那句短应答）。'
+                    '不带参数=查询当前策略。'
+                    '可以改三样：用哪个词、哪些话不播、整体开关。'
+                    '改不了的是时机——它永远在请求发出的同一瞬间播出，不占模型推理时间；'
+                    '这个机制没有开关，也不要试图在回答里替它说。'
+                    '要改先找依据：老张明确说过，或 memory_context 里有长期偏好。'
+                    '不能凭一次对话就改，改必须写 reason。'),
+    'inputSchema': {'type': 'object', 'properties': {
+        'word': {'type': 'string',
+                 'description': '新的即时回复词，1-4 个字，例如「收到」「在的」'},
+        'skip_patterns': {'type': 'array', 'items': {'type': 'string'},
+                          'description': '以这些词开头的发言不播应答，前缀匹配，最多 20 条'},
+        'enabled': {'type': 'boolean', 'description': '整体开关，false 则一句都不播'},
+        'reason': {'type': 'string', 'description': '修改理由，会写进策略文件留痕'}},
+        'required': [], 'additionalProperties': False},
+}
+
+# 退出词：和即时回复词同一条边界 —— 内容归大肥鱼裁定，机制不归它。
+# 说明词表能换，但「关灯，拜拜」先回答再退出、「用英语怎么说再见」不算退出
+# 这些判定规则写死在语音层，这里既改不了也不该暗示能改。
+schemas['voice_exit_words'] = {
+    'name': 'voice_exit_words',
+    'description': ('查看或修改语音退出词（说完这些词就结束当前对话）。'
+                    '不带参数=查询当前词表。'
+                    '能改的只有词表本身；判定规则改不了——'
+                    '"关灯，拜拜"会先答完再退出，"用英语怎么说再见"不会当成退出，'
+                    '这些写在语音层，别向老张承诺能改。'
+                    '要改先找依据：老张明确说过，或 memory_context 里有长期偏好。'
+                    '不能凭一次对话就改，改必须写 reason。'),
+    'inputSchema': {'type': 'object', 'properties': {
+        'exit_words': {'type': 'array', 'items': {'type': 'string'},
+                       'description': '新的完整词表（整表替换），每条 1-8 个字，最多 20 条，不能为空'},
+        'reason': {'type': 'string', 'description': '修改理由，会写进策略文件留痕'}},
+        'required': [], 'additionalProperties': False},
+}
+
+
+# 开机：电脑关机后 NAS 上没有任何进程能叫醒它，只能发 WOL 幻数据包。
+# 只有插网线那块（Realtek，已开 Shutdown Wake-On-LAN）才可靠；
+# 走 WiFi 时从关机状态唤醒基本不通，别向用户承诺。
+schemas['pc_wake'] = {
+    'name': 'pc_wake',
+    'description': ('给老张那台 Windows 发网络唤醒包（WOL），用于电脑关机或睡眠后远程开机。'
+                    '只在电脑插着网线时可靠，WiFi 下多半无效。'
+                    '发出去不等于开机成功：要等 30-60 秒后用 pc_status 确认，别直接说已开机。'),
+    'inputSchema': {'type': 'object', 'properties': {}, 'required': [],
+                    'additionalProperties': False},
+}
+
+# 文件能力（2026-11-18）：白名单目录内列目录/读文本/准备发送。
+# 微信网关会自动把「回复里出现的本地文件路径」当附件发出，所以 file_send 只负责
+# 把文件复制成 ASCII 安全名并落到一个网关能识别的路径，路径由模型写进回复。
+for _name, _desc, _props, _req in [
+    ('nas_file_list',
+     '列出 NAS 上允许读取的文件（白名单目录 /vol1/1000/downloads）。'
+     '用户问「NAS 上有什么文件」「找一下某个文件」时用。只列文件名和大小，不读内容。', {}, []),
+    ('nas_file_read',
+     '读取 NAS 白名单目录里文本文件的文字内容（上限 20 万字符）。'
+     '用户说「读一下这个文件」「看看里面写了什么」时用。'
+     '图片/PDF/压缩包等二进制文件读不了，要用 nas_file_send 直接发原文件。',
+     {'path': {'type': 'string', 'description': '文件名或相对白名单目录的路径，支持按文件名模糊匹配'}}, ['path']),
+    ('nas_file_send',
+     '把 NAS 白名单目录里的一个文件准备好发到老张手机。'
+     '调用成功后，把返回的 send_path 原样写进你的回复文本，微信网关会自动把它作为附件发出。'
+     '用户说「把某个文件发我手机」「发一下那个文件」时用。'
+     '一次只发一个文件；文件名含中文没关系，工具会换成安全名。',
+     {'path': {'type': 'string', 'description': '文件名或相对白名单目录的路径，支持按文件名模糊匹配'}}, ['path']),
+]:
+    schemas[_name] = {'name': _name, 'description': _desc,
+                      'inputSchema': {'type': 'object', 'properties': _props,
+                                      'required': _req, 'additionalProperties': False}}
+
+# 本地音乐（2026-11-19）：让 Hermes 语义理解后自己拉起播放。
+# 桥接 /music/command 的 docstring 明写是给 "xiaozhi provider and Hermes' music tool" 用的，
+# 但受限链路的 home MCP 一直没暴露这个工具。这里补上：传用户原话，桥接侧 intent.py
+# 做意图识别 + 拼音模糊匹配（"半分作旧"→"晚风作酒" score 0.88），handled=true 即已触发播放。
+schemas['music'] = {
+    'name': 'music',
+    'description': (
+        '点播或控制客厅小爱的本地音乐。用户说「播放晚风作酒」「放周慧敏的歌」'
+        '「下一首」「暂停」「继续播放」「随便放首歌」「曲库有什么歌」时用。'
+        'text 传用户的原话（照原样传，包括可能听错的音，桥接侧有拼音容错）。'
+        '返回 handled=true 表示桥接已执行，say 是对用户的话术，照说即可；'
+        'handled=false 时说明没找到或没成功，按 error 如实说，不要假装放好了。'),
+    'inputSchema': {'type': 'object', 'properties': {
+        'text': {'type': 'string', 'description': '用户的点歌/控制原话，照原样传'}},
+        'required': ['text'], 'additionalProperties': False},
+}
+
+if not READ_ONLY:
+    # 2026-10-29 移除 device_confirm：空调改为 device_set 直接下发。
+    pass
+
+
+VOICE_MODE = os.environ.get('HOME_MCP_VOICE') == '1'
+VOICE_TOOLS = frozenset({'device_list', 'device_set', 'ha_logbook', 'reminder_add',
+                         'reminder_list', 'morning_weather_status',
+                         'weather_query', 'news_headlines', 'music'})
+if VOICE_MODE:
+    schemas = {name: schema for name, schema in schemas.items() if name in VOICE_TOOLS}
+
+PRESENCE_PERSON = os.environ.get('PRESENCE_PERSON', 'person.kai')
+PRESENCE_ZONE = os.environ.get('PRESENCE_ZONE', 'zone.home')
+
+# ── 音乐桥鉴权 token（短期，带缓存续期）────────────────────────────────
+_music_token_cache = {'token': None, 'exp': 0.0}
+
+
+def _music_token(auth_url):
+    """从 xiaoqi-auth 取 music-bridge token；失败返回 None（让调用走无 token 兼容路径）。"""
+    import time as _t
+    now = _t.time()
+    if _music_token_cache['token'] and now < _music_token_cache['exp'] - 60:
+        return _music_token_cache['token']
+    cid = os.environ.get('XIAOQI_AUTH_CLIENT', 'hermes-home')
+    secret = os.environ.get('XIAOQI_AUTH_SECRET', '')
+    if not secret:
+        return None
+    try:
+        data = json.dumps({'grant_type': 'client_credentials', 'client_id': cid,
+                           'client_secret': secret, 'aud': 'music-bridge'}).encode()
+        req = urllib.request.Request(auth_url + '/token', data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            result = json.loads(r.read().decode('utf-8'))
+        _music_token_cache['token'] = result['access_token']
+        _music_token_cache['exp'] = now + int(result.get('expires_in', 900))
+        return _music_token_cache['token']
+    except Exception:
+        return None
+
+# ── 文件能力：白名单 + 安全路径 ────────────────────────────────────────
+# 白名单按"真实路径前缀"校验，符号链接一律先 realpath 再判，挡住 .. 与软链越狱。
+FILE_ALLOW = [os.path.realpath(p) for p in
+              os.environ.get('NAS_FILE_ALLOW', '/vol1/1000/downloads').split(':') if p]
+FILE_DROP_DIR = os.environ.get('FILE_DROP_DIR', '/vol1/1000/agent/data/file_drop')
+FILE_MAX = int(os.environ.get('NAS_FILE_MAX', str(30 * 1024 * 1024)))  # 30MB
+FILE_SENSITIVE = ('env', 'token', 'secret', 'password', 'passwd', 'credential',
+                  'private', 'id_rsa', '.git', 'config.yaml', 'life.env')
+
+
+def _file_allowed(path):
+    """返回 realpath 后的绝对路径；不在白名单/敏感文件/太大则抛 ValueError。"""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError('empty path')
+    real = os.path.realpath(os.path.expanduser(path.strip()))
+    if not any(real == root or real.startswith(root + os.sep) for root in FILE_ALLOW):
+        raise ValueError('path outside whitelist')
+    if not os.path.isfile(real):
+        raise ValueError('not a file')
+    low = os.path.basename(real).lower()
+    if any(tok in low for tok in FILE_SENSITIVE):
+        raise ValueError('sensitive filename rejected')
+    if os.path.getsize(real) > FILE_MAX:
+        raise ValueError('file too large (>%d MB)' % (FILE_MAX // 1024 // 1024))
+    return real
+
+
+def _nas_file_list_tool(args):
+    rows = []
+    for root in FILE_ALLOW:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith('.')][:20]
+            for fn in files[:200]:
+                if fn.startswith('.'):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                try:
+                    rows.append({'name': fn, 'size': os.path.getsize(fp),
+                                 'path': fp})
+                except OSError:
+                    pass
+            if len(rows) >= 200:
+                break
+    return {'ok': True, 'roots': FILE_ALLOW, 'count': len(rows), 'files': rows[:200]}
+
+
+def _resolve_one(rel):
+    """用户给相对名时，在白名单根目录按文件名精确/包含匹配，唯一命中才返回。"""
+    rel = str(rel).strip()
+    if os.path.isabs(rel):
+        return _file_allowed(rel)
+    hits = []
+    for root in FILE_ALLOW:
+        cand = os.path.join(root, rel)
+        if os.path.isfile(cand):
+            hits.append(cand)
+    if not hits:
+        needle = os.path.basename(rel).lower()
+        for root in FILE_ALLOW:
+            for dirpath, _, files in os.walk(root):
+                for fn in files:
+                    if needle in fn.lower():
+                        hits.append(os.path.join(dirpath, fn))
+                if len(hits) > 20:
+                    break
+    uniq = list(dict.fromkeys(os.path.realpath(h) for h in hits))
+    if not uniq:
+        raise ValueError('no matching file in whitelist')
+    if len(uniq) > 1:
+        raise ValueError('ambiguous name, %d matches; be specific' % len(uniq))
+    return _file_allowed(uniq[0])
+
+
+def _nas_file_read_tool(args):
+    import re as _re
+    p = _resolve_one(args.get('path', ''))
+    if _re.search(r'\.(png|jpg|jpeg|gif|webp|pdf|zip|mp3|mp4|docx?|xlsx?)$',
+                  p, _re.I):
+        raise ValueError('binary file; use nas_file_send to deliver original')
+    with open(p, 'r', encoding='utf-8', errors='replace') as fh:
+        text = fh.read(200000)
+    return {'ok': True, 'path': p, 'name': os.path.basename(p),
+            'chars': len(text), 'text': text}
+
+
+def _nas_file_send_tool(args):
+    import re as _re
+    import shutil
+    import uuid
+    p = _resolve_one(args.get('path', ''))
+    ext = os.path.splitext(p)[1].lower()
+    if not _re.fullmatch(r'\.[a-z0-9]{1,8}', ext):
+        ext = '.bin'
+    os.makedirs(FILE_DROP_DIR, exist_ok=True)
+    safe = 'fd_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8] + ext
+    dest = os.path.join(FILE_DROP_DIR, safe)
+    shutil.copyfile(p, dest)
+    return {'ok': True, 'send_path': dest, 'name': safe,
+            'original': os.path.basename(p), 'size': os.path.getsize(dest),
+            'note': '把 send_path 原样写进回复，微信网关会自动作为附件发出'}
+
+
+# ── HA 只读票据（2026-11-23）：走反代后本进程不再持有 HA_TOKEN ──────────
+_ha_token_cache = {'token': None, 'exp': 0.0}
+
+
+def _ha_token(auth_url):
+    """从 xiaoqi-auth 取 ha-proxy 只读票（scope=ha:read）；失败返回 None。"""
+    import time as _t
+    now = _t.time()
+    if _ha_token_cache['token'] and now < _ha_token_cache['exp'] - 60:
+        return _ha_token_cache['token']
+    cid = os.environ.get('XIAOQI_AUTH_CLIENT', 'hermes-home')
+    secret = os.environ.get('XIAOQI_AUTH_SECRET', '')
+    if not secret:
+        return None
+    try:
+        data = json.dumps({'grant_type': 'client_credentials', 'client_id': cid,
+                           'client_secret': secret, 'aud': 'ha-proxy'}).encode()
+        req = urllib.request.Request(auth_url + '/token', data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            result = json.loads(r.read().decode('utf-8'))
+        _ha_token_cache['token'] = result['access_token']
+        _ha_token_cache['exp'] = now + int(result.get('expires_in', 900))
+        return _ha_token_cache['token']
+    except Exception:
+        return None
+
+
+def _ha_states_get(path, timeout=15):
+    """HA 只读。默认直连（兼容/回滚）；XIAOQI_HA_VIA_PROXY=1 时走反代持票。
+
+    反代模式是 fail-closed：取票失败直接抛错，不回退直连——否则"认证挂了"
+    会悄悄变成"用全能 token 放行"，违背认证中心的设计初衷。
+    """
+    if os.environ.get('XIAOQI_HA_VIA_PROXY') == '1':
+        auth_url = os.environ.get('XIAOQI_AUTH_URL', '').rstrip('/')
+        if not auth_url:
+            raise RuntimeError('XIAOQI_HA_VIA_PROXY=1 但未配置 XIAOQI_AUTH_URL')
+        token = _ha_token(auth_url)
+        if not token:
+            raise RuntimeError('HA 反代取票失败（auth 不可达或无 ha:read scope）')
+        base = os.environ.get('HA_PROXY_URL', 'http://127.0.0.1:8124').rstrip('/')
+        req = urllib.request.Request(base + path,
+                                     headers={'Authorization': 'Bearer ' + token})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8'))
+    base = os.environ.get('HA_URL', 'http://192.168.10.107:8123').rstrip('/')
+    token = os.environ.get('HA_TOKEN', '')
+    req = urllib.request.Request(base + path,
+                                 headers={'Authorization': 'Bearer ' + token})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
+def _to_local(iso):
+    if not iso:
+        return ''
+    try:
+        d = datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return str(iso)
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """两点球面距离（米）。用于回答「离家多远」，不用于推断作息。"""
+    from math import asin, cos, radians, sin, sqrt
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = (sin(dlat / 2) ** 2
+         + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2)
+    return 2 * 6371000 * asin(sqrt(a))
+
+
+def _ha_presence():
+    """只读：人和家的位置。
+
+    2026-10-29 起同时返回两套坐标：家的固定坐标（zone.home）和人的上报坐标
+    （person.kai，源头是手机 device_tracker）。人的坐标可能过期，所以带上
+    data_age_minutes 与 coords_fresh，避免拿几天前的点当现在的位置回答。
+    """
+    try:
+        j = _ha_states_get('/api/states/' + PRESENCE_PERSON)
+    except Exception as ex:
+        return {'ok': False, 'error': f'读取 {PRESENCE_PERSON} 失败: {type(ex).__name__}'}
+    state = str(j.get('state') or '')
+    attrs = j.get('attributes') or {}
+    last_changed = j.get('last_changed') or j.get('last_updated') or ''
+
+    radius = home_lat = home_lon = None
+    try:
+        zone = _ha_states_get('/api/states/' + PRESENCE_ZONE)
+        zattrs = zone.get('attributes') or {}
+        radius = zattrs.get('radius')
+        home_lat, home_lon = zattrs.get('latitude'), zattrs.get('longitude')
+    except Exception:
+        pass
+
+    person_lat = attrs.get('latitude')
+    person_lon = attrs.get('longitude')
+    distance_m = None
+    if None not in (person_lat, person_lon, home_lat, home_lon):
+        try:
+            distance_m = round(_haversine_m(float(person_lat), float(person_lon),
+                                            float(home_lat), float(home_lon)))
+        except (TypeError, ValueError):
+            distance_m = None
+
+    age_min = None
+    try:
+        d = datetime.fromisoformat(str(last_changed).replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        age_min = round((datetime.now(timezone.utc) - d).total_seconds() / 60)
+    except ValueError:
+        pass
+    # 手机 10 分钟没上报就当作不可信的旧点，让模型自己别硬答。
+    coords_fresh = age_min is not None and age_min <= 10
+
+    valid = state not in ('', 'unknown', 'unavailable', 'None')
+    if state == 'home':
+        state_cn, at_home, zone_name = '在家', True, 'home'
+    elif not valid:
+        state_cn, at_home, zone_name = '未知', False, ''
+    elif state == 'not_home':
+        state_cn, at_home, zone_name = '不在家', False, ''
+    else:
+        state_cn, at_home, zone_name = f'不在家（在「{state}」）', False, state
+
+    notes = []
+    if not valid:
+        notes.append('手机尚未上报位置：需要在手机安装 HA Companion App，登录这台 HA '
+                     '并授予「始终允许」定位权限，地理围栏才会更新该实体')
+    else:
+        if str(attrs.get('source') or '') == 'router':
+            notes.append('当前依据路由器连接判断，精度较粗')
+        try:
+            d = datetime.fromisoformat(str(last_changed).replace('Z', '+00:00'))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            age_h = (datetime.now(timezone.utc) - d).total_seconds() / 3600
+            if age_h > 24:
+                notes.append(f'该状态已保持约 {age_h:.0f} 小时，手机上报可能已停止')
+        except ValueError:
+            pass
+
+    if not coords_fresh and age_min is not None:
+        notes.append(f'坐标停在 {age_min // 60} 小时前，不能当现在的实时位置用；'
+                     '要是问「我现在在哪 / 离家多远」，先说明这是旧点')
+
+    return {'ok': True, 'person': PRESENCE_PERSON, 'state': state or 'unknown',
+            'state_cn': state_cn, 'at_home': at_home, 'zone': zone_name,
+            'since': _to_local(last_changed),
+            'source': str(attrs.get('source') or ''),
+            'gps_accuracy_m': attrs.get('gps_accuracy'),
+            'home_radius_m': radius, 'note': '；'.join(notes),
+            'home': {'latitude': home_lat, 'longitude': home_lon,
+                     'radius_m': radius, 'name': '我的家'},
+            'person_coords': {'latitude': person_lat, 'longitude': person_lon,
+                              'accuracy_m': attrs.get('gps_accuracy')},
+            'distance_to_home_m': distance_m,
+            'data_age_minutes': age_min,
+            'coords_fresh': coords_fresh}
+
+
+ACK_POLICY_PATH = '/vol1/1000/xiaozhi/data/ack_policy.json'
+
+
+def _ack_policy_tool(args):
+    """读/写即时回复词策略。写入是原子的（tmp + replace），坏文件不会让播报哑火。"""
+    try:
+        with open(ACK_POLICY_PATH, encoding='utf-8') as f:
+            cur = json.load(f)
+        if not isinstance(cur, dict):
+            cur = {}
+    except (OSError, ValueError):
+        cur = {}
+
+    if not args:
+        return {'ok': True, 'policy': cur,
+                'note': '这就是当前生效值；改完下一句立即生效，不用重启'}
+
+    new = dict(cur)
+    if 'word' in args:
+        w = str(args['word']).strip()
+        if not 1 <= len(w) <= 4:
+            return {'ok': False, 'error': 'word 只能是 1-4 个字，太长了念出来很怪'}
+        new['word'] = w
+    if 'skip_patterns' in args:
+        sp = args['skip_patterns']
+        if not isinstance(sp, list) or not all(isinstance(x, str) for x in sp):
+            return {'ok': False, 'error': 'skip_patterns 必须是字符串数组'}
+        if len(sp) > 20:
+            return {'ok': False, 'error': 'skip_patterns 最多 20 条'}
+        new['skip_patterns'] = [x.strip() for x in sp if x.strip()]
+    if 'enabled' in args:
+        new['enabled'] = bool(args['enabled'])
+
+    reason = str(args.get('reason') or '').strip()
+    if not reason:
+        return {'ok': False, 'error': '改策略必须给 reason：依据是什么，谁说的'}
+    new['updated_at'] = datetime.now(TZ).strftime('%Y-%m-%d %H:%M')
+    new['updated_by'] = '大肥鱼'
+    new['reason'] = reason[:200]
+
+    try:
+        os.makedirs(os.path.dirname(ACK_POLICY_PATH), exist_ok=True)
+        tmp = ACK_POLICY_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(new, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ACK_POLICY_PATH)
+    except OSError as ex:
+        return {'ok': False, 'error': f'写入失败: {type(ex).__name__}'}
+
+    return {'ok': True, 'policy': new, 'note': '已保存，下一句生效'}
+
+
+EXIT_POLICY_PATH = '/vol1/1000/xiaoqi/logs/exit_words.json'
+DEFAULT_EXIT_WORDS = ('拜拜', '再见', '退出', '退下', '没事了', '不用了', '结束对话',
+                      'bye', 'goodbye')
+
+
+def _exit_words_tool(args):
+    """读/写语音退出词策略。写入原子（tmp + replace），坏文件不会让退出词失效。
+
+    文件由 xiaoqi-bridge 容器以 /app/logs/exit_words.json 读取，
+    宿主机 /vol1/1000/xiaoqi/logs 就是容器里那个挂载目录。
+    """
+    try:
+        with open(EXIT_POLICY_PATH, encoding='utf-8') as f:
+            cur = json.load(f)
+        if not isinstance(cur, dict):
+            cur = {}
+    except (OSError, ValueError):
+        cur = {}
+
+    if not args:
+        return {'ok': True, 'policy': cur,
+                'note': '这就是当前生效值；改完下一次识别立即生效，不用重启'}
+
+    new = dict(cur)
+    if 'exit_words' in args:
+        ew = args['exit_words']
+        if not isinstance(ew, list) or not all(isinstance(x, str) for x in ew):
+            return {'ok': False, 'error': 'exit_words 必须是字符串数组'}
+        words = []
+        for x in ew:
+            w = x.strip()
+            if not w:
+                continue
+            if len(w) > 8:
+                return {'ok': False, 'error': f'「{w}」太长：退出词每条最多 8 个字'}
+            words.append(w)
+        if not words:
+            return {'ok': False, 'error': '不能清空词表，否则只能等超时退出'}
+        if len(words) > 20:
+            return {'ok': False, 'error': '退出词最多 20 条'}
+        new['exit_words'] = list(dict.fromkeys(words))
+
+    reason = str(args.get('reason') or '').strip()
+    if not reason:
+        return {'ok': False, 'error': '改退出词必须给 reason：依据是什么，谁说的'}
+    new['updated_at'] = datetime.now(TZ).strftime('%Y-%m-%d %H:%M')
+    new['updated_by'] = '大肥鱼'
+    new['reason'] = reason[:200]
+
+    try:
+        os.makedirs(os.path.dirname(EXIT_POLICY_PATH), exist_ok=True)
+        tmp = EXIT_POLICY_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(new, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, EXIT_POLICY_PATH)
+    except OSError as ex:
+        return {'ok': False, 'error': f'写入失败: {type(ex).__name__}'}
+
+    return {'ok': True, 'policy': new, 'note': '已保存，下一句生效'}
+
+
+def _pc_wake_tool(_args=None):
+    """发 WOL 幻数据包。MAC 和广播地址可用环境变量覆盖。"""
+    import socket
+    mac_raw = (os.environ.get('PC_WOL_MAC') or '00-D8-61-19-1A-57').strip()
+    target = (os.environ.get('PC_WOL_BROADCAST') or '192.168.10.255').strip()
+    try:
+        digits = [int(x, 16) for x in mac_raw.replace(':', '-').split('-')]
+    except ValueError:
+        return {'ok': False, 'error': 'MAC 格式不对：' + mac_raw}
+    if len(digits) != 6:
+        return {'ok': False, 'error': 'MAC 必须是 6 段：' + mac_raw}
+    packet = bytes([255]) * 6 + bytes(digits) * 16
+    sent = []
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            for port in (9, 7):
+                sock.sendto(packet, (target, port))
+                sent.append('%s:%d' % (target, port))
+        finally:
+            sock.close()
+    except OSError as exc:
+        return {'ok': False, 'error': '发送失败：%s' % exc}
+    return {'ok': True, 'mac': mac_raw, 'sent_to': sent,
+            'note': '唤醒包已发出，但发出去不等于开机成功；等 30-60 秒再查状态'}
+
+
+def handle(msg):
+    method, params = msg.get('method'), msg.get('params') or {}
+    if method == 'initialize':
+        return {'protocolVersion': params.get('protocolVersion', '2024-11-05'),
+                'capabilities': {'tools': {'listChanged': False}},
+                'serverInfo': {'name': 'nas-home', 'version': '1.0.0'}}
+    if method == 'ping':
+        return {}
+    if method == 'tools/list':
+        return {'tools': list(schemas.values())}
+    if method == 'tools/call':
+        name, args = params.get('name'), params.get('arguments') or {}
+        if name not in schemas:
+            raise ValueError('unknown tool')
+        if not isinstance(args, dict):
+            raise ValueError('arguments must be an object')
+        if os.getenv('HOME_MCP_READ_ONLY') == '1' and name not in {
+                'memory_context', 'morning_weather_status', 'device_list', 'kb_search',
+                'event_query', 'reminder_list', 'ha_logbook', 'ha_presence',
+                'weather_query', 'news_headlines'}:
+            raise ValueError('read-only verification session')
+        if name in ('nas_file_list', 'nas_file_read', 'nas_file_send'):
+            fn = {'nas_file_list': _nas_file_list_tool,
+                  'nas_file_read': _nas_file_read_tool,
+                  'nas_file_send': _nas_file_send_tool}[name]
+            res = fn(args)
+            return {'content': [{'type': 'text',
+                                 'text': json.dumps(res, ensure_ascii=False)}],
+                    'isError': res.get('ok') is False}
+        if name == 'pc_wake':
+            res = _pc_wake_tool(args)
+            return {'content': [{'type': 'text', 'text': json.dumps(res, ensure_ascii=False)}],
+                    'isError': res.get('ok') is False}
+        if name == 'music':
+            # 音乐桥不可用时明确报错（fail-closed 风格），不要静默吞成"已执行"。
+            # 鉴权：配了 XIAOQI_AUTH_URL 就从认证中心取短期 token 带上（带缓存续期）；
+            # 没配则不带 token（兼容认证中心尚未部署的状态）。
+            try:
+                payload = json.dumps({'text': str(args.get('text') or '')},
+                                     ensure_ascii=False).encode('utf-8')
+                headers = {'Content-Type': 'application/json'}
+                auth_url = os.environ.get('XIAOQI_AUTH_URL', '').rstrip('/')
+                if auth_url:
+                    token = _music_token(auth_url)
+                    if token:
+                        headers['Authorization'] = 'Bearer ' + token
+                req = urllib.request.Request(
+                    'http://127.0.0.1:4400/music/command', data=payload,
+                    headers=headers)
+                with urllib.request.urlopen(req, timeout=25) as response:
+                    raw = response.read().decode('utf-8')
+                res = json.loads(raw)
+                return {'content': [{'type': 'text', 'text': raw}],
+                        'isError': res.get('handled') is False}
+            except Exception as ex:
+                res = {'ok': False, 'handled': False,
+                       'error': f'音乐桥未响应: {type(ex).__name__}: {str(ex)[:120]}'}
+                return {'content': [{'type': 'text',
+                                     'text': json.dumps(res, ensure_ascii=False)}],
+                        'isError': True}
+        if name == 'morning_weather_status':
+            with urllib.request.urlopen('http://127.0.0.1:8787/rules/morning-weather', timeout=15) as response:
+                raw = response.read().decode('utf-8')
+            return {'content': [{'type': 'text', 'text': raw}], 'isError': False}
+        if name == 'ha_presence':
+            res = _ha_presence()
+            return {'content': [{'type': 'text',
+                                 'text': json.dumps(res, ensure_ascii=False)}],
+                    'isError': res.get('ok') is False}
+        if name == 'voice_ack_policy':
+            res = _ack_policy_tool(args)
+            return {'content': [{'type': 'text',
+                                 'text': json.dumps(res, ensure_ascii=False)}],
+                    'isError': res.get('ok') is False}
+        if name == 'voice_exit_words':
+            res = _exit_words_tool(args)
+            return {'content': [{'type': 'text',
+                                 'text': json.dumps(res, ensure_ascii=False)}],
+                    'isError': res.get('ok') is False}
+        if name.startswith('memory_'):
+            path = '/memory/' + {'memory_context': 'context', 'memory_remember': 'remember',
+                                 'memory_retract': 'retract'}[name]
+            data = None if name == 'memory_context' else json.dumps(args, ensure_ascii=False).encode('utf-8')
+            req = urllib.request.Request('http://127.0.0.1:8787'+path, data=data,
+                                         headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=20) as response:
+                raw = response.read().decode('utf-8')
+            return {'content': [{'type': 'text', 'text': raw}], 'isError': False}
+        if name in ('kb_search', 'kb_add'):
+            if name == 'kb_search':
+                params = {'q': args.get('query', ''), 'k': args.get('k', 6)}
+                if args.get('tags'):
+                    params['tags'] = args['tags']
+                path, data = '/kb/search?' + urllib.parse.urlencode(params), None
+            else:
+                path, data = '/kb/add', json.dumps(args, ensure_ascii=False).encode('utf-8')
+            req = urllib.request.Request('http://127.0.0.1:8788'+path, data=data,
+                                         headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw = response.read().decode('utf-8')
+            return {'content': [{'type': 'text', 'text': raw}], 'isError': False}
+        if name == 'device_set':
+            dev = args.get('device')
+            if dev in CLIMATE or dev in INFRARED_CLIMATE:
+                if args.get('temp') is None and not args.get('mode'):
+                    raise ValueError('climate needs temp or mode')
+                if set(args) - {'device', 'temp', 'mode'}:
+                    raise ValueError('unexpected climate arguments: '
+                                     + ','.join(sorted(set(args) - {'device', 'temp', 'mode'})))
+            elif dev in ICE_MAKERS:
+                # 制冰机有两条通道：power（开关）与 size（尺寸），至少给一个。
+                # 传了别的字段就直接拒，别让「顺手带个 temp」悄悄穿过白名单。
+                if args.get('power') not in ('on', 'off') and not args.get('size'):
+                    raise ValueError('ice maker needs power=on/off or size=大冰块/小冰块')
+                if set(args) - {'device', 'power', 'size'}:
+                    raise ValueError('unexpected ice maker arguments: '
+                                     + ','.join(sorted(set(args) - {'device', 'power', 'size'})))
+            elif dev in LIGHTS:
+                if args.get('power') not in ('on', 'off'):
+                    raise ValueError('switch needs power=on/off')
+                if set(args) - {'device', 'power'}:
+                    raise ValueError('unexpected switch arguments: '
+                                     + ','.join(sorted(set(args) - {'device', 'power'})))
+            else:
+                raise ValueError('unknown device alias: ' + str(dev)[:40])
+        with contextlib.redirect_stdout(sys.stderr):
+            raw = exec_tool(name, json.dumps(args, ensure_ascii=False),
+                            ToolCtx(source='hermes', user_text=json.dumps(args, sort_keys=True)))
+        result = json.loads(raw)
+        return {'content': [{'type': 'text', 'text': raw}],
+                'isError': result.get('ok') is False}
+    raise LookupError('method not found')
+
+
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+        if 'id' not in msg:
+            continue
+        try:
+            response = {'jsonrpc': '2.0', 'id': msg['id'], 'result': handle(msg)}
+        except LookupError:
+            response = {'jsonrpc': '2.0', 'id': msg['id'],
+                        'error': {'code': -32601, 'message': 'Method not found'}}
+        except Exception as ex:
+            # 以前统一吞成 'Tool arguments or execution invalid'，
+            # 结果「参数写错」「设备不在白名单」「只读通道」三种情况长得一模一样。
+            response = {'jsonrpc': '2.0', 'id': msg['id'],
+                        'error': {'code': -32602,
+                                  'message': 'tool rejected: '
+                                             + f'{type(ex).__name__}: {ex}'[:180]}}
+        print(json.dumps(response, ensure_ascii=False), flush=True)
+    except (ValueError, TypeError):
+        print(json.dumps({'jsonrpc': '2.0', 'id': None,
+                          'error': {'code': -32700, 'message': 'Parse error'}}), flush=True)

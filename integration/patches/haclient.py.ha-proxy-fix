@@ -1,0 +1,480 @@
+# -*- coding: utf-8 -*-
+"""haclient.py —— Home Assistant 控制，带三层白名单。
+
+模型永远只能传别名（客厅 / 餐厅 / 次卧吸顶灯 / 主卧空调），
+别名到 entity_id 的翻译只发生在 config.entity_of()。
+即使模型被诱导说出某个 entity_id，这里也会因为不是别名而拒绝。
+"""
+import httpx
+import json
+import os
+import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
+from config import (S, LIGHTS, CLIMATE, ICE_MAKERS, ICE_SIZE, INFRARED_CLIMATE,
+                    ALLOWED_SERVICES, BANNED_PREFIXES,
+                    ALLOWED_NOTIFY, ALLOWED_MEDIA, TEMP_MIN, TEMP_MAX,
+                    entity_of, device_alias_table,
+                    ACTIVITY_MAX_HOURS, ACTIVITY_DEVICE_ALIASES, ACTIVITY_BLOCKED_DOMAINS)
+
+# 固定东八区：home_mcp 是 Hermes 拉起的子进程，不能假设环境里有 TZ
+TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
+
+
+class Forbidden(Exception):
+    """请求越过安全边界。与「执行失败」区分开：这个不该重试。"""
+
+
+class HAClient:
+    def __init__(self):
+        # 2026-11-23 反代开关：XIAOQI_HA_VIA_PROXY=1 时改走 ha-proxy（8124），
+        # 本进程不再持有 HA_TOKEN，改为凭短期票据（按调用域取 ha:read / ha:*:write）。
+        # 默认关闭——保持现状直连，出问题可一键退回复。
+        self._proxy = os.environ.get("XIAOQI_HA_VIA_PROXY") == "1"
+        self.base = (os.environ.get("HA_PROXY_URL", "http://127.0.0.1:8124").rstrip("/")
+                     if self._proxy else S.ha_url)
+        self.token = S.ha_token
+        self._auth_url = os.environ.get("XIAOQI_AUTH_URL", "").rstrip("/")
+        self._tok_cache = {}  # scope -> (token, exp)
+
+    def _ticket(self, scope: str) -> str:
+        """走反代时按 scope 取票（缓存续期）；失败抛错（fail-closed，不回退直连）。"""
+        now = time.time()
+        cached = self._tok_cache.get(scope)
+        if cached and now < cached[1] - 60:
+            return cached[0]
+        cid = os.environ.get("XIAOQI_AUTH_CLIENT", "hermes-home")
+        secret = os.environ.get("XIAOQI_AUTH_SECRET", "")
+        if not (self._auth_url and secret):
+            raise RuntimeError("HA 反代模式缺少 XIAOQI_AUTH_URL/SECRET")
+        data = json.dumps({"grant_type": "client_credentials", "client_id": cid,
+                           "client_secret": secret, "aud": "ha-proxy"}).encode()
+        req = urllib.request.Request(self._auth_url + "/token", data=data,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                result = json.loads(r.read().decode("utf-8"))
+        except Exception as ex:
+            raise RuntimeError(f"HA 反代取票失败: {type(ex).__name__}: {ex}") from ex
+        tok = result.get("access_token")
+        if not tok:
+            raise RuntimeError(f"HA 反代取票失败: {result.get('error', 'no access_token')}")
+        self._tok_cache[scope] = (tok, now + int(result.get("expires_in", 900)))
+        return tok
+
+    def _headers(self, scope: str = "ha:read") -> dict:
+        if self._proxy:
+            return {"Authorization": f"Bearer {self._ticket(scope)}"}
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def _client(self, read: float = 12.0) -> httpx.Client:
+        # 四个参数必须齐（connect/read/write/pool）：httpx 只接受「给 default」
+        # 或「给全四个」，漏一个就在构造瞬间抛 ValueError。
+        # 2026-10-21 就因为这个漏了 pool，导致所有真正下发到 HA 的调用全部失败，
+        # 而 device_list 不碰 HA，所以表面上「列表正常」把问题盖住了。
+        return httpx.Client(timeout=httpx.Timeout(connect=2.0, read=read,
+                                                 write=5.0, pool=3.0))
+
+    # ---- 校验 ----
+    @staticmethod
+    def _assert_service(service: str):
+        if service not in ALLOWED_SERVICES:
+            raise Forbidden(f"服务 {service} 不在白名单")
+
+    @staticmethod
+    def _assert_entity(eid: str):
+        # 例外只有两个：制冰功能开关、制冰尺寸选择。
+        # 同机的出水、UV、杀菌、保冷、童锁仍受前缀禁令约束。
+        if eid in ICE_MAKERS.values():
+            return
+        if eid in {meta["entity_id"] for meta in ICE_SIZE.values()}:
+            return
+        for bad in BANNED_PREFIXES:
+            if eid.startswith(bad):
+                raise Forbidden(f"实体 {eid} 属于禁止操作范围")
+
+    # ---- 读 ----
+    def states(self, domains=("switch", "light", "climate", "select")) -> list[dict]:
+        with self._client() as c:
+            r = c.get(f"{self.base}/api/states", headers=self._headers())
+        r.raise_for_status()
+        out = []
+        for s in r.json():
+            if s["entity_id"].split(".")[0] in domains:
+                out.append({"entity_id": s["entity_id"], "state": s["state"],
+                            "name": s["attributes"].get("friendly_name", "")})
+        return out
+
+    def get_state(self, eid: str) -> dict:
+        with self._client() as c:
+            r = c.get(f"{self.base}/api/states/{eid}", headers=self._headers())
+        r.raise_for_status()
+        j = r.json()
+        return {"entity_id": j["entity_id"], "state": j["state"],
+                "attributes": j.get("attributes", {})}
+
+    # ---- 读：活动日志（HA「活动」页同款，全程只读）----
+    @staticmethod
+    def activity_window(period, start=None, end=None) -> tuple:
+        """把 period 换算成本地时间窗。参数不合法就抛 Forbidden（由 exec_tool 兜底）。"""
+        now = datetime.now(TZ).replace(microsecond=0)
+        if period in (None, "", "last_3h"):
+            return now - timedelta(hours=3), now
+        if period == "today":
+            return now.replace(hour=0, minute=0, second=0), now
+        if period == "yesterday":
+            today0 = now.replace(hour=0, minute=0, second=0)
+            return today0 - timedelta(days=1), today0 - timedelta(seconds=1)
+        if period == "last_24h":
+            return now - timedelta(days=1), now
+        if period == "custom":
+            if not start:
+                raise Forbidden("period=custom 必须给 start，格式 YYYY-MM-DD HH:MM")
+            try:
+                st = datetime.strptime(str(start).strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+            except ValueError:
+                raise Forbidden("start 格式应为 YYYY-MM-DD HH:MM")
+            if end:
+                try:
+                    en = datetime.strptime(str(end).strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+                except ValueError:
+                    raise Forbidden("end 格式应为 YYYY-MM-DD HH:MM")
+            else:
+                en = now
+            return st, en
+        raise Forbidden("period 只能是 last_3h/today/yesterday/last_24h/custom")
+
+    def _logbook_raw(self, start: datetime, end: datetime) -> list:
+        """GET /api/logbook/<start>?end_time=<end>。
+
+        起始时间必须放在路径里：放 ?start_time= 会被接口静默忽略，
+        返回「今天全天」，看起来像数据不对（2026-10-22 踩过）。
+        """
+        s = quote(start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00"), safe="")
+        e = quote(end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00"), safe="")
+        with self._client(read=25.0) as c:
+            r = c.get(f"{self.base}/api/logbook/{s}?end_time={e}", headers=self._headers())
+        r.raise_for_status()
+        return r.json()
+
+    def _units(self) -> dict:
+        """entity_id → 单位。拿不到就返回空表，不影响活动查询本身。"""
+        try:
+            with self._client() as c:
+                r = c.get(f"{self.base}/api/states", headers=self._headers())
+            r.raise_for_status()
+            return {s["entity_id"]: (s.get("attributes") or {}).get("unit_of_measurement", "")
+                    for s in r.json() if isinstance(s, dict) and s.get("entity_id")}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _activity_row(e: dict, units: dict) -> dict:
+        """把一条原始记录渲染成「活动」页那一行。"""
+        when = str(e.get("when") or "")
+        try:
+            ts = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.astimezone(TZ)
+        except ValueError:
+            ts = datetime.now(TZ)
+
+        name = str(e.get("name") or e.get("entity_id") or "")
+        # 名称形如「设备名  实体名」（双空格）；带 * 自定义补充 的条目是「设备名 * 实体名」
+        if "  " in name:
+            device, what = name.split("  ", 1)
+        elif " * " in name:
+            device, what = name.split(" * ", 1)
+        else:
+            device, what = name, ""
+
+        eid = str(e.get("entity_id") or "")
+        attrs = e.get("attributes") or {}
+        state = e.get("state")
+        if eid.startswith("event."):
+            # event 实体的 state 是时间戳，真正含义在 attributes.event_type
+            state = attrs.get("event_type") or "事件"
+        else:
+            state = {"on": "开启", "off": "关闭", "unavailable": "不可用",
+                     "unknown": "未知"}.get(str(state), str(state))
+            unit = units.get(eid)
+            if unit:
+                try:
+                    float(state)
+                    state = f"{state} {unit}"
+                except (TypeError, ValueError):
+                    pass
+
+        return {"at": ts.strftime("%H:%M:%S"), "_ts": ts.timestamp(),
+                "device": device, "what": what, "state": state,
+                "icon": e.get("icon") or ""}
+
+    def logbook(self, period="last_3h", start=None, end=None,
+                device=None, limit=40) -> dict:
+        """查询「活动」时间线。只读：本方法没有任何 services 调用路径。"""
+        st, en = self.activity_window(period, start, end)
+        if en <= st:
+            raise Forbidden("结束时间必须晚于开始时间")
+        if (en - st) > timedelta(hours=ACTIVITY_MAX_HOURS):
+            raise Forbidden(f"一次最多查 {ACTIVITY_MAX_HOURS} 小时")
+
+        prefix = None
+        if device:
+            if device not in ACTIVITY_DEVICE_ALIASES:
+                raise Forbidden(f"没有这个设备：{device}。可用的是 {list(ACTIVITY_DEVICE_ALIASES)}")
+            prefix = ACTIVITY_DEVICE_ALIASES[device]
+
+        raw = self._logbook_raw(st, en)
+        units = self._units()
+
+        rows, seen = [], set()
+        for e in raw:
+            if not isinstance(e, dict) or "state" not in e:
+                continue                      # 只有 message 的自动化条目，跳过
+            eid = str(e.get("entity_id") or "")
+            if not eid or any(eid.startswith(b) for b in ACTIVITY_BLOCKED_DOMAINS):
+                continue
+            if prefix and prefix not in eid and prefix not in str(e.get("name") or ""):
+                continue
+            key = (eid, e.get("when"), str(e.get("state")))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(self._activity_row(e, units))
+
+        rows.sort(key=lambda x: x["_ts"], reverse=True)
+        total = len(rows)
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit = 40
+        shown = rows[:limit]
+
+        by_device = {}
+        for r in rows:
+            by_device[r["device"]] = by_device.get(r["device"], 0) + 1
+
+        out = {"ok": True,
+               "window": {"start": st.strftime("%Y-%m-%d %H:%M"),
+                          "end": en.strftime("%Y-%m-%d %H:%M"),
+                          "tz": "Asia/Shanghai"},
+               "total": total, "shown": len(shown), "truncated": total > len(shown),
+               "by_device": dict(sorted(by_device.items(), key=lambda kv: -kv[1])[:8]),
+               "entries": [{k: v for k, v in r.items() if k != "_ts"} for r in shown]}
+        if not rows:
+            out["note"] = ("这段时间没有记录。可能是确实没发生，也可能超出 recorder 保留期"
+                           "（默认 10 天）——不要把「无记录」当成「没发生」。")
+        return out
+
+    # ---- 写 ----
+    # 写调用按域映射 scope（反代模式才生效；直连模式 _headers 忽略参数）
+    _WRITE_SCOPE = {"light": "ha:light:write", "switch": "ha:switch:write",
+                    "climate": "ha:climate:write", "notify": "ha:notify:write",
+                    "media_player": "ha:media:write"}
+
+    def _call(self, domain: str, service: str, data: dict) -> bool:
+        scope = self._WRITE_SCOPE.get(domain, "ha:read")
+        with self._client() as c:
+            r = c.post(f"{self.base}/api/services/{domain}/{service}",
+                       headers=self._headers(scope), json=data)
+        return r.status_code < 300
+
+    def switch_set(self, alias: str, on: bool) -> dict:
+        eid = entity_of(alias)
+        if not eid:
+            raise Forbidden(f"没有这个设备：{alias}。可用的是 "
+                            f"{list(LIGHTS) + list(CLIMATE) + list(INFRARED_CLIMATE) + list(ICE_MAKERS)}")
+        if alias in CLIMATE or alias in INFRARED_CLIMATE:
+            raise Forbidden(f"{alias} 是空调，请用温度/模式控制")
+        self._assert_entity(eid)
+        service = "turn_on" if on else "turn_off"
+        self._assert_service("switch." + service)
+        ok = self._call("switch", service, {"entity_id": eid})
+        # 回读校验：不信 HA 的返回值，信状态
+        st = self.get_state(eid)["state"]
+        want = "on" if on else "off"
+        deadline = time.monotonic() + 8
+        while ok and st != want and time.monotonic() < deadline:
+            time.sleep(1)
+            st = self.get_state(eid)["state"]
+        return {"ok": ok and st == want, "device": alias, "state": st,
+                "want": want, "verified": ok and st == want}
+
+    def ice_size_set(self, alias: str, size: str) -> dict:
+        """切换制冰尺寸（大冰块 / 小冰块）。
+
+        size 只认 ICE_SIZE 里登记的说法，翻译成设备字面量之后才下发；
+        模型即使说「大块」「小的」也不会把别的 select 实体带进来。
+        小米这套 select 是异步上报的，所以下发后最多等 8 秒看状态真变了没有，
+        没变就如实报「未验证成功」，不假设它听懂了。
+        """
+        meta = ICE_SIZE.get(alias)
+        if not meta:
+            raise Forbidden(f"{alias} 不支持改制冰尺寸")
+        opt = meta["options"].get(str(size or "").strip())
+        if not opt:
+            raise Forbidden("制冰尺寸只能是「大冰块」或「小冰块」")
+        eid = meta["entity_id"]
+        self._assert_entity(eid)
+        self._assert_service("select.select_option")
+        ok = self._call("select", "select_option", {"entity_id": eid, "option": opt})
+        st = self.get_state(eid)["state"]
+        deadline = time.monotonic() + 8
+        while ok and st != opt and time.monotonic() < deadline:
+            time.sleep(1)
+            st = self.get_state(eid)["state"]
+        return {"ok": ok and st == opt, "device": alias, "size": st,
+                "want": opt, "verified": ok and st == opt}
+
+    def climate_set(self, alias: str, temp: int | None = None,
+                    mode: str | None = None, fan: str | None = None) -> dict:
+        eid = entity_of(alias)
+        if not eid:
+            raise Forbidden(f"没有这个设备：{alias}")
+        if alias not in CLIMATE:
+            raise Forbidden(f"{alias} 不是空调")
+        self._assert_entity(eid)
+
+        if temp is not None:
+            if not (TEMP_MIN <= int(temp) <= TEMP_MAX):
+                raise Forbidden(f"温度只能在 {TEMP_MIN}-{TEMP_MAX} 度之间")
+            self._assert_service("climate.set_temperature")
+            self._call("climate", "set_temperature",
+                       {"entity_id": eid, "temperature": int(temp)})
+        if mode:
+            if mode not in ("auto", "cool", "heat", "dry", "fan_only", "off"):
+                raise Forbidden(f"模式 {mode} 不认识")
+            self._assert_service("climate.set_hvac_mode")
+            self._call("climate", "set_hvac_mode",
+                       {"entity_id": eid, "hvac_mode": mode})
+        if fan:
+            if fan not in ("自动", "低", "中", "高"):
+                raise Forbidden(f"风速 {fan} 不认识")
+            # set_fan_mode 不在白名单服务里，走 climate 域的通用调用
+            # （开关空调时风速跟着模式走，这里刻意不开放单改风速）
+
+        # lumi 集成是异步上报的：HA 收到 service 调用只是转发，状态要等设备回执。
+        # 同步读会拿到上一帧，把「已经开机」报成 off——2026-10-28 实测就踩了这个：
+        # set_temperature(26) 之后立刻读是 off，3 秒后才变 cool。这里等属性真变了再返回。
+        want_temp = int(temp) if temp is not None else None
+        deadline = time.monotonic() + 8
+        st = self.get_state(eid)
+        while True:
+            attrs = st.get("attributes", {})
+            temp_ok = want_temp is None or attrs.get("temperature") == want_temp
+            mode_ok = not mode or st.get("state") == mode
+            if (temp_ok and mode_ok) or time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+            st = self.get_state(eid)
+        attrs = st.get("attributes", {})
+        verified = ((want_temp is None or attrs.get("temperature") == want_temp)
+                    and (not mode or st.get("state") == mode))
+        return {"ok": verified, "verified": verified, "device": alias,
+                "state": st["state"],
+                "temperature": attrs.get("temperature"),
+                "hvac_mode": st["state"],
+                "fan_mode": attrs.get("fan_mode"),
+                "current_temperature": attrs.get("current_temperature")}
+
+    def infrared_climate_set(self, alias: str, temp: int | None = None,
+                             mode: str | None = None) -> dict:
+        """客厅空调走红外遥控：只能发码，状态读不回来。
+
+        两条硬约束决定了这里的顺序：
+        1) 空调关着时单发温度码不会启动，所以只要动温度就必须先按开机；
+        2) 模式码通常带完整状态，先把模式定下来再调温度，否则会被覆盖。
+        因此固定走「开机 → 模式 → 温度」，宁可多按一次开机（已开机时按开机无副作用）。
+        """
+        meta = INFRARED_CLIMATE.get(alias)
+        if not meta:
+            raise Forbidden(f"{alias} 不是红外空调")
+        if temp is None and not mode:
+            raise Forbidden("空调要给温度或模式")
+        if temp is not None and not (TEMP_MIN <= int(temp) <= TEMP_MAX):
+            raise Forbidden(f"温度只能在 {TEMP_MIN}-{TEMP_MAX} 度之间")
+        if mode and mode != "off" and mode not in meta["modes"]:
+            raise Forbidden(f"模式 {mode} 不认识")
+
+        self._assert_service("button.press")
+        if mode == "off":
+            self._assert_entity(meta["power_off"])
+        else:
+            self._assert_entity(meta["power_on"])
+
+        if mode == "off":
+            ok = self._call("button", "press", {"entity_id": meta["power_off"]})
+            if not ok:
+                raise Forbidden("红外关机码没有发出去")
+            return {"ok": True, "verified": None, "device": alias, "state": "unknown",
+                    "sent": ["关机"],
+                    "note": "红外单向：关机码已发出，空调是否响应无法回读"}
+
+        sent = []
+        self._call("button", "press", {"entity_id": meta["power_on"]})
+        sent.append("开机")
+        if mode:
+            self._assert_service("select.select_option")
+            self._assert_entity(meta["mode"])
+            if not self._call("select", "select_option",
+                              {"entity_id": meta["mode"],
+                               "option": meta["modes"][mode]}):
+                raise Forbidden("红外模式码没有发出去")
+            sent.append("模式 " + meta["modes"][mode])
+        if temp is not None:
+            self._assert_service("number.set_value")
+            self._assert_entity(meta["temperature"])
+            if not self._call("number", "set_value",
+                              {"entity_id": meta["temperature"], "value": int(temp)}):
+                raise Forbidden("红外温度码没有发出去")
+            sent.append(f"{int(temp)} 度")
+
+        return {"ok": True, "verified": None, "device": alias, "state": "unknown",
+                "temperature": int(temp) if temp is not None else None,
+                "hvac_mode": mode, "sent": sent,
+                "note": "红外单向：码已发出，空调是否响应无法回读，请以实物为准"}
+
+    def notify_say(self, text: str) -> dict:
+        self._assert_entity(ALLOWED_NOTIFY)
+        ok = self._call("notify", "send_message",
+                        {"entity_id": ALLOWED_NOTIFY, "message": text})
+        return {"ok": ok}
+
+    def unmute(self) -> dict:
+        self._assert_entity(ALLOWED_MEDIA)
+        ok = self._call("media_player", "volume_mute",
+                        {"entity_id": ALLOWED_MEDIA, "is_volume_muted": False})
+        return {"ok": ok}
+
+    # ---- 给工具用 ----
+    def list_devices(self, domain: str = "all") -> list[dict]:
+        table = device_alias_table()
+        live = {}
+        try:
+            for s in self.states():
+                live[s["entity_id"]] = s
+        except Exception:
+            pass
+        out = []
+        for alias, meta in table.items():
+            if domain != "all" and meta["domain"] != domain:
+                continue
+            st = live.get(meta["entity_id"], {})
+            if meta.get("readback") is False:
+                # 红外空调没有状态回读：这里如实标注，别让模型把 unknown 当成真实状态
+                out.append({"device": alias, "kind": meta["kind"], "state": "unknown",
+                            "note": "红外单向，只能发指令，没法查询当前开关和温度"})
+                continue
+            item = {"device": alias, "kind": meta["kind"],
+                    "state": st.get("state", "unknown")}
+            if meta.get("size_entity"):
+                # 一次 /api/states 已经带回所有实体，尺寸不必再单独请求
+                item["size"] = live.get(meta["size_entity"], {}).get("state", "unknown")
+            out.append(item)
+        return out
+
+
+HA = HAClient()

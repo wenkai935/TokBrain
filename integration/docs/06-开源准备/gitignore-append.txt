@@ -1,0 +1,46 @@
+# ===== 小七家庭部署：运行数据与隐私（追加到仓库 .gitignore 末尾）=====
+
+# 本地真实配置（只保留 *.example.* 入库）
+config.py
+data/.config.yaml
+*.env
+.env*
+
+# 运行日志 / 健康事件（含家庭设备活动隐私）
+*.log
+*.jsonl
+logs/
+audio-health.jsonl
+
+# 数据库与密钥证书
+*.db
+*.sqlite*
+*.pem
+*.key
+id_rsa*
+mysql/
+
+# 模型与大文件（用 Release/LFS 或外链，不进主仓库）
+*.pt
+*.onnx
+*.pth
+*.safetensors
+models/
+
+# 备份 / 曲库 / 运行产物
+backup/
+backups/
+voice-patch/
+music/
+playback/
+
+# 归档与成片
+*.tar
+*.tar.gz
+output/*.mp4
+
+# 保留脱敏样例（放在这些规则之后，确保 example 文件能入库）
+!config.example.py
+!*.example.yaml
+!*.example.yml
+!.env.example
